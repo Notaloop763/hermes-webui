@@ -355,6 +355,8 @@ const LOCALES = {
    cmd_learn:'Learn a reusable skill from dirs, URLs, this chat, or notes',
    learn_failed:'Learn failed: ',
    learn_no_prompt:'no prompt returned',
+   learn_composer_busy:'composer changed — keeping your draft',
+   learn_session_changed:'session changed — prompt discarded',
    branch_forked:'Forked into new session',
    branch_failed:'Fork failed: ',
    fork_from_here:'Fork from here',

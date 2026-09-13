@@ -16541,10 +16541,10 @@ def handle_post(handler, parsed) -> bool:
     # the normal chat pipeline, so the agent runs it in the live conversation
     # (same builder used by the CLI, gateway and TUI /learn paths).
     if parsed.path == "/api/learn":
-        from agent.learn_prompt import build_learn_prompt
-
-        request = str(body.get("request", "") or "").strip()
         try:
+            from agent.learn_prompt import build_learn_prompt
+
+            request = str(body.get("request", "") or "").strip()
             prompt = build_learn_prompt(request)
             return j(handler, {"prompt": prompt})
         except Exception as e:

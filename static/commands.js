@@ -1798,12 +1798,20 @@ async function cmdBtw(args){
 async function cmdLearn(args){
   if(!S.session){showToast(t('no_active_session'));return;}
   const request=(args||'').trim();
+  // The slash dispatcher clears the composer without awaiting us, so a user
+  // draft typed during the /api/learn round-trip must win over the prompt.
+  const ownerSid=S.session.session_id;
   try{
     const r=await api('/api/learn',{method:'POST',body:JSON.stringify({request})});
     const prompt=r&&r.prompt;
     if(!prompt){showToast(t('learn_failed')+t('learn_no_prompt'));return;}
+    if(!S.session){showToast(t('no_active_session'));return;}
+    if(S.session.session_id!==ownerSid){showToast(t('learn_failed')+t('learn_session_changed'));return;}
     const inp=$('msg');
-    if(inp){inp.value=prompt;if(typeof autoResize==='function')autoResize();}
+    if(inp){
+      if((inp.value||'').trim()){showToast(t('learn_failed')+t('learn_composer_busy'));return;}
+      inp.value=prompt;if(typeof autoResize==='function')autoResize();
+    }
     if(typeof send==='function'){await send();}
   }catch(e){showToast(t('learn_failed')+(e&&e.message||e));}
 }
