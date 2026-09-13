@@ -106,6 +106,9 @@ SESSION_LOAD_IN_FLIGHT_FOR_SRC = _extract_function(
 SETTLE_STRANDED_CONVERSATION_LOADING_SRC = _extract_function(
     SESSIONS_SRC, "_settleStrandedConversationLoading"
 )
+ARM_STRANDED_TIMER_SRC = _extract_function(
+    SESSIONS_SRC, "_armStrandedConversationLoadingTimer"
+)
 
 
 _NODE_SCRIPT = r'''
@@ -322,4 +325,231 @@ def test_timer_with_matching_stamp_writes_retry():
     )
     assert case["loadCalls"] == [{"sid": "sid-a", "opts": {"force": True}}], (
         "clicking Retry must call loadSession(sid, {force: true})"
+    )
+
+
+# ── Fake-clock tests: drive the REAL scheduled callback (#7553 review) ───────
+# The scenarios above call _settleStrandedConversationLoading directly with
+# crafted stamps, which only proves settlement *after* expiration — not that
+# production ever invokes settlement at the right time. These drive the real
+# callback captured from _armStrandedConversationLoadingTimer under a fake
+# clock: no Retry at 4s, Retry at the expiry boundary, stale callbacks leave
+# newer placeholders untouched, and metadata-without-messages still settles.
+
+_NODE_TIMER_SCRIPT = r'''
+const M2 = { loadCalls: [] };
+let nowMs = 1000000;
+Date.now = () => nowMs;
+const pendingTimers = [];
+let timerSeq = 0;
+globalThis.setTimeout = (cb, ms) => {
+  timerSeq += 1;
+  pendingTimers.push({ id: timerSeq, cb, due: nowMs + Number(ms), delay: Number(ms) });
+  return timerSeq;
+};
+globalThis.clearTimeout = (id) => {
+  const i = pendingTimers.findIndex((t) => t.id === id);
+  if (i >= 0) pendingTimers.splice(i, 1);
+};
+function advance(ms) {
+  nowMs += ms;
+  const fire = [];
+  for (let i = pendingTimers.length - 1; i >= 0; i--) {
+    if (pendingTimers[i].due <= nowMs) fire.push(pendingTimers.splice(i, 1)[0]);
+  }
+  fire.sort((a, b) => a.due - b.due).forEach((t) => t.cb());
+}
+
+function makeTimerInner(stamp) {
+  const el = {
+    dataset: { conversationLoadingSince: String(stamp) },
+    _html: '',
+    _text: 'Loading conversation...',
+    _retry: null,
+    querySelector(sel) {
+      if (sel === '#conversationLoadRetry') {
+        return { addEventListener: (t, f) => { if (t === 'click') el._retry = f; } };
+      }
+      return null;
+    },
+  };
+  Object.defineProperty(el, 'innerHTML', {
+    get() { return this._html; },
+    set(v) {
+      this._html = String(v);
+      if (this._html.indexOf('conversationLoadRetry') !== -1) this._text = '';
+    },
+  });
+  Object.defineProperty(el, 'textContent', {
+    get() { return this._text; },
+    set(v) { this._text = String(v); },
+  });
+  return el;
+}
+
+let timerInner = null;
+function installTimerEnv({ stamp, loadingSid, generation, sessionId, messages }) {
+  timerInner = makeTimerInner(stamp);
+  globalThis.$ = (id) => (id === 'msgInner' ? timerInner : null);
+  globalThis._loadingSessionId = loadingSid;
+  globalThis._loadSessionGeneration = generation;
+  globalThis.S = { session: sessionId === null ? null : { session_id: sessionId } };
+  if (messages !== undefined) globalThis.S.messages = messages;
+  globalThis.loadSession = (sid, opts) => { M2.loadCalls.push({ sid, opts }); };
+  M2.loadCalls.length = 0;
+  pendingTimers.length = 0;
+}
+
+__SESSION_LOAD_IN_FLIGHT_MAX_MS_SRC__
+__CONVERSATION_LOADING_AGE_MS_SRC__
+__SESSION_LOAD_IN_FLIGHT_FOR_SRC__
+__SETTLE_STRANDED_CONVERSATION_LOADING_SRC__
+__ARM_STRANDED_TIMER_SRC__
+
+function retryWritten() {
+  return timerInner._html.indexOf('conversationLoadRetry') !== -1;
+}
+
+const T0 = 1000000;
+const timerResults = {};
+
+// A: the arm path schedules the real callback at the expiry deadline.
+{
+  installTimerEnv({ stamp: T0, loadingSid: 'sid-a', generation: 1, sessionId: 'sid-other', messages: [] });
+  nowMs = T0;
+  _armStrandedConversationLoadingTimer('sid-a', T0, 1);
+  timerResults.armedDelay = pendingTimers.length ? pendingTimers[pendingTimers.length - 1].delay : null;
+}
+
+// B: no Retry at 4s; Retry appears at the expiry boundary via the real callback.
+{
+  installTimerEnv({ stamp: T0, loadingSid: 'sid-a', generation: 1, sessionId: 'sid-other', messages: [] });
+  nowMs = T0;
+  _armStrandedConversationLoadingTimer('sid-a', T0, 1);
+  advance(4000);
+  timerResults.noRetryAt4s = !retryWritten();
+  advance(16000);
+  timerResults.retryAtExpiry = retryWritten();
+  if (timerInner._retry) timerInner._retry();
+  timerResults.retryLoadCalls = M2.loadCalls.slice();
+}
+
+// C: a stale scheduled callback (lost clearTimeout) leaves the newer placeholder alone,
+// while the newer load's own callback still settles at its expiry.
+{
+  installTimerEnv({ stamp: T0, loadingSid: 'sid-a', generation: 1, sessionId: 'sid-other', messages: [] });
+  nowMs = T0;
+  _armStrandedConversationLoadingTimer('sid-a', T0, 1);
+  const staleCb = pendingTimers[0].cb;
+  // Load B takes over: re-stamps the placeholder, bumps the generation, owns the latch.
+  timerInner.dataset.conversationLoadingSince = String(T0 + 5000);
+  globalThis._loadingSessionId = 'sid-b';
+  globalThis._loadSessionGeneration = 2;
+  _armStrandedConversationLoadingTimer('sid-b', T0 + 5000, 2);
+  staleCb();
+  timerResults.staleUntouched = !retryWritten()
+    && timerInner._text.indexOf('Loading conversation') !== -1;
+  advance(25000);
+  timerResults.newerSettlesAtOwnExpiry = retryWritten();
+}
+
+// D: metadata assigned (S.session matches) but the messages request never
+// resolves — the exact gap a bare session_id check misreads as completion.
+{
+  installTimerEnv({ stamp: T0, loadingSid: 'sid-a', generation: 1, sessionId: 'sid-a', messages: [] });
+  nowMs = T0;
+  _armStrandedConversationLoadingTimer('sid-a', T0, 1);
+  advance(20000);
+  timerResults.metaWithoutMessagesSettles = retryWritten();
+}
+
+// E: metadata assigned AND a renderable transcript arrived → stand down.
+{
+  installTimerEnv({ stamp: T0, loadingSid: 'sid-a', generation: 1, sessionId: 'sid-a', messages: [{ role: 'user', content: 'hi' }] });
+  nowMs = T0;
+  _armStrandedConversationLoadingTimer('sid-a', T0, 1);
+  advance(20000);
+  timerResults.metaWithTranscriptStandsDown = !retryWritten();
+}
+
+console.log(JSON.stringify(timerResults));
+'''
+
+
+def _build_timer_script() -> str:
+    return (
+        _NODE_TIMER_SCRIPT.replace(
+            "__SESSION_LOAD_IN_FLIGHT_MAX_MS_SRC__", SESSION_LOAD_IN_FLIGHT_MAX_MS_SRC
+        )
+        .replace("__CONVERSATION_LOADING_AGE_MS_SRC__", CONVERSATION_LOADING_AGE_MS_SRC)
+        .replace("__SESSION_LOAD_IN_FLIGHT_FOR_SRC__", SESSION_LOAD_IN_FLIGHT_FOR_SRC)
+        .replace(
+            "__SETTLE_STRANDED_CONVERSATION_LOADING_SRC__",
+            SETTLE_STRANDED_CONVERSATION_LOADING_SRC,
+        )
+        .replace("__ARM_STRANDED_TIMER_SRC__", ARM_STRANDED_TIMER_SRC)
+    )
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_expiry_timer_armed_at_deadline():
+    """The arm path must schedule the real callback at the expiry deadline.
+
+    Guards the reviewed flaw: a 4s callback racing the 20s latch can never
+    settle, so production must arm at _SESSION_LOAD_IN_FLIGHT_MAX_MS.
+    """
+    assert "_SESSION_LOAD_IN_FLIGHT_MAX_MS" in ARM_STRANDED_TIMER_SRC, (
+        "the arm helper must schedule at the expiry deadline"
+    )
+    assert "4000" not in ARM_STRANDED_TIMER_SRC, (
+        "the arm helper must not use a separate early callback"
+    )
+    body = _run_node(_build_timer_script())
+    assert body["armedDelay"] == 20000, (
+        "the real scheduled callback must fire at the 20s expiry deadline"
+    )
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_no_retry_before_expiry_retry_at_expiry():
+    """Drive the real scheduled callback: silent at 4s, Retry at 20s."""
+    body = _run_node(_build_timer_script())
+    assert body["noRetryAt4s"] is True, "no Retry may appear before the deadline"
+    assert body["retryAtExpiry"] is True, "Retry must appear at the expiry boundary"
+    assert body["retryLoadCalls"] == [{"sid": "sid-a", "opts": {"force": True}}], (
+        "clicking Retry must call loadSession(sid, {force: true})"
+    )
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_stale_scheduled_callback_leaves_newer_placeholder():
+    """A superseded load's captured callback must not settle the newer load."""
+    body = _run_node(_build_timer_script())
+    assert body["staleUntouched"] is True, (
+        "a stale stamp+generation must leave the newer placeholder untouched"
+    )
+    assert body["newerSettlesAtOwnExpiry"] is True, (
+        "the newer load's own callback must still settle at its expiry"
+    )
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_metadata_without_messages_still_settles():
+    """S.session assigned but messages never resolve → still Retry.
+
+    A bare S.session.session_id check misreads this gap as completion;
+    placeholder text plus ownership stamp plus no transcript must settle.
+    """
+    body = _run_node(_build_timer_script())
+    assert body["metaWithoutMessagesSettles"] is True, (
+        "metadata without a renderable transcript must still settle to Retry"
+    )
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_metadata_with_transcript_stands_down():
+    """S.session assigned AND a renderable transcript arrived → no Retry."""
+    body = _run_node(_build_timer_script())
+    assert body["metaWithTranscriptStandsDown"] is True, (
+        "an arrived transcript must stand the settle down"
     )

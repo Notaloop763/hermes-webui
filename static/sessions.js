@@ -46,7 +46,7 @@ function _sessionLoadInFlightFor(sid){
 // that text on screen with no way out: clicking the session again hit the same
 // bail, so the pane stayed stuck until the page was thrown away. Settle it with
 // an explicit, retryable state instead of an endless pseudo-spinner.
-function _settleStrandedConversationLoading(settleSid, expectedStamp){
+function _settleStrandedConversationLoading(settleSid, expectedStamp, expectedGeneration){
   try {
     const inner = $('msgInner');
     if (!inner || typeof inner.textContent !== 'string') return;
@@ -64,7 +64,26 @@ function _settleStrandedConversationLoading(settleSid, expectedStamp){
     // and owns the pane — do not touch it.
     if (_loadingSessionId !== settleSid && _sessionLoadInFlightFor(_loadingSessionId)) return;
     if (_sessionLoadInFlightFor(settleSid)) return;                       // a load still owns the pane
-    if (S.session && S.session.session_id === settleSid) return;          // loaded after all
+    // Timer path with an explicit generation: a same-session supersede bumps
+    // _loadSessionGeneration, so a stale callback must stand down even if the
+    // stamp collides (e.g. coarse clocks). Skipped for the immediate
+    // cancel-path call, where no generation was captured.
+    if (expectedGeneration !== undefined && expectedGeneration !== null) {
+      if (_loadSessionGeneration !== expectedGeneration) return;
+    }
+    // Metadata acceptance is not completion: the messages fetch can still be
+    // pending (or return no renderable rows) while the loading text remains
+    // visible. Only stand down when a renderable transcript actually arrived;
+    // placeholder text plus matching ownership stamp is the completion signal.
+    if (S.session && S.session.session_id === settleSid) {
+      let _renderedTranscript = false;
+      try {
+        if (S && Array.isArray(S.messages)) {
+          for (const m of S.messages) { if (m && m.role) { _renderedTranscript = true; break; } }
+        }
+      } catch (_) { _renderedTranscript = false; }
+      if (_renderedTranscript) return;                                        // loaded after all
+    }
     inner.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:var(--text-muted);font-size:14px;padding:40px;text-align:center;">Couldn\u2019t load this conversation.<button type="button" id="conversationLoadRetry" style="margin-left:10px;font:inherit;color:inherit;cursor:pointer;background:none;border:1px solid currentColor;border-radius:4px;padding:2px 10px;">Retry</button></div>';
     const retry = (typeof inner.querySelector === 'function') ? inner.querySelector('#conversationLoadRetry') : null;
     if (retry && typeof retry.addEventListener === 'function') {
@@ -73,6 +92,13 @@ function _settleStrandedConversationLoading(settleSid, expectedStamp){
   } catch (_) {
     // UI polish only: never let the escape hatch itself break a load path.
   }
+}
+// One coherent lifecycle (#7553 review): the expiry timer is armed at the
+// actual expiration deadline, so the callback can only run once the latch
+// above has expired. The captured stamp+generation must still own the
+// placeholder when it fires (see _settleStrandedConversationLoading).
+function _armStrandedConversationLoadingTimer(sid, loadingStamp, loadGeneration){
+  setTimeout(() => _settleStrandedConversationLoading(sid, loadingStamp, loadGeneration), _SESSION_LOAD_IN_FLIGHT_MAX_MS);
 }
 // Each loadSession() invocation gets a monotonically increasing generation.
 // `_loadingSessionId` only tracks destination session_id, so same-session
@@ -1918,7 +1944,9 @@ async function loadSession(sid){
         // renderMessages(), so any terminal path that never renders (this is the
         // last synchronous point before the metadata fetch) strands it. The
         // helper no-ops when a render or a newer load already took over.
-        setTimeout(() => _settleStrandedConversationLoading(sid, loadingStamp), 4000);
+        // One coherent lifecycle: arm at the actual expiration deadline, so
+        // the callback can only run once the latch above has expired (#7553).
+        _armStrandedConversationLoadingTimer(sid, loadingStamp, _loadGeneration);
       }
     }
   }
