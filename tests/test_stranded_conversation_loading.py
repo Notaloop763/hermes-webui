@@ -5,7 +5,9 @@ The in-flight latch helpers (``_conversationLoadingAgeMs`` /
 (``_settleStrandedConversationLoading``) are extracted verbatim from
 ``static/sessions.js`` and exercised under node with hand-rolled DOM shims
 (no JSDOM). Every assertion is on observable behavior — helper return values,
-innerHTML writes, and retry-click dispatch — never on source strings.
+innerHTML writes, and retry-click dispatch — plus two narrow source-structure
+pins where a behavior harness cannot reach production wiring (arm deadline,
+force-reload re-arm).
 """
 
 from __future__ import annotations
@@ -109,6 +111,7 @@ SETTLE_STRANDED_CONVERSATION_LOADING_SRC = _extract_function(
 ARM_STRANDED_TIMER_SRC = _extract_function(
     SESSIONS_SRC, "_armStrandedConversationLoadingTimer"
 )
+LOAD_SESSION_SRC = _extract_function(SESSIONS_SRC, "loadSession")
 
 
 _NODE_SCRIPT = r'''
@@ -472,6 +475,27 @@ const timerResults = {};
   timerResults.metaWithTranscriptStandsDown = !retryWritten();
 }
 
+// F (timer mechanics only — the re-arm here is hand-simulated; production
+// wiring is pinned by test_same_session_force_reload_rearm_pinned_in_load_session):
+// given a re-stamped + re-armed same-session reload, the original timer stands
+// down at its expiry (stamp+generation mismatch) and the new timer settles.
+{
+  installTimerEnv({ stamp: T0, loadingSid: 'sid-a', generation: 1, sessionId: 'sid-a', messages: [] });
+  nowMs = T0;
+  _armStrandedConversationLoadingTimer('sid-a', T0, 1);
+  // Same-session force reload at T0+5000: re-stamp, bump generation, re-arm.
+  nowMs = T0 + 5000;
+  timerInner.dataset.conversationLoadingSince = String(T0 + 5000);
+  globalThis._loadSessionGeneration = 2;
+  _armStrandedConversationLoadingTimer('sid-a', T0 + 5000, 2);
+  // Advance past the original expiry (T0+20000): original callback stands down.
+  advance(15000); // nowMs = T0+20000
+  timerResults.sameSessionForceReloadOriginalStandsDown = !retryWritten();
+  // Advance to the new expiry (T0+25000): new callback settles → Retry.
+  advance(5000); // nowMs = T0+25000
+  timerResults.sameSessionForceReloadNewSettles = retryWritten();
+}
+
 console.log(JSON.stringify(timerResults));
 '''
 
@@ -552,4 +576,53 @@ def test_metadata_with_transcript_stands_down():
     body = _run_node(_build_timer_script())
     assert body["metaWithTranscriptStandsDown"] is True, (
         "an arrived transcript must stand the settle down"
+    )
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_same_session_force_reload_rearm_pinned_in_load_session():
+    """loadSession must re-stamp + re-arm the timer on same-session force reload.
+
+    Source-structure pin: the mechanics test below hand-simulates the re-arm, so
+    it cannot prove production performs it. This pins the production branch
+    itself — a ``sameSessionForceReload``-gated re-stamp of
+    ``conversationLoadingSince`` plus an ``_armStrandedConversationLoadingTimer``
+    call with the new generation, conditioned on the placeholder still showing
+    "Loading conversation" (so Retry/rendered panes never arm a timer).
+    """
+    m = re.search(
+        r"if\s*\(\s*sameSessionForceReload\b(.*?)\{\s*"
+        r"const loadingStamp\s*=\s*Date\.now\(\);\s*"
+        r"_msgInner\.dataset\.conversationLoadingSince\s*=\s*String\(loadingStamp\);\s*"
+        r"_armStrandedConversationLoadingTimer\(sid,\s*loadingStamp,\s*_loadGeneration\);",
+        LOAD_SESSION_SRC,
+        re.S,
+    )
+    assert m, (
+        "loadSession must re-stamp + re-arm the expiry timer on a same-session "
+        "force reload (forced reload otherwise loses its only timer)"
+    )
+    assert "Loading conversation" in m.group(1), (
+        "the re-arm must be conditioned on the Loading placeholder text so "
+        "Retry/rendered panes never arm a timer"
+    )
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_same_session_force_reload_timer_mechanics():
+    """Timer mechanics given a re-armed same-session reload (hand-simulated).
+
+    The original timer stands down at its expiry (stamp+generation mismatch
+    from the re-stamped, re-armed same-session reload), and the new timer
+    settles at its own expiry → Retry appears. This drives the extracted timer
+    helpers only; the production re-arm branch itself is pinned by
+    test_same_session_force_reload_rearm_pinned_in_load_session.
+    """
+    body = _run_node(_build_timer_script())
+    assert body["sameSessionForceReloadOriginalStandsDown"] is True, (
+        "the original timer must stand down at its expiry (stamp+generation "
+        "mismatch from the re-stamped, re-armed same-session reload)"
+    )
+    assert body["sameSessionForceReloadNewSettles"] is True, (
+        "the re-armed timer must settle at its own expiry → Retry appears"
     )

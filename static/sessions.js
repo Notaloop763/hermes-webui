@@ -1949,6 +1949,28 @@ async function loadSession(sid){
         _armStrandedConversationLoadingTimer(sid, loadingStamp, _loadGeneration);
       }
     }
+    // Same-session force-reload branch: the arm block above is gated on
+    // `currentSid !== sid`, so a forced reload of the active session (Retry click
+    // → loadSession(sid,{force:true})) never re-stamps the placeholder or
+    // re-arms the timer. The original timer fires with the old generation, sees
+    // the bumped _loadSessionGeneration, and stands down. If the forced attempt
+    // also strands (no render), no timer remains → permanent "Loading
+    // conversation...". Re-stamp + re-arm here with the NEW generation so the
+    // 20s window restarts for the new attempt and ownership transfers to it.
+    // Do NOT arm when the placeholder is absent/already rendered or settled to
+    // Retry (text check). The check is on the visible text, not on
+    // keep-stale-until-loaded: a keep-stale reload arriving on top of a prior
+    // strand still shows "Loading conversation" and correctly re-arms here
+    // (the pane is still Loading, so it still needs a timer); a keep-stale
+    // reload with the old transcript visible shows no Loading text and
+    // correctly skips.
+    if (sameSessionForceReload && _msgInner && _msgInner.dataset &&
+        typeof _msgInner.textContent === 'string' &&
+        _msgInner.textContent.indexOf('Loading conversation') !== -1) {
+      const loadingStamp = Date.now();
+      _msgInner.dataset.conversationLoadingSince = String(loadingStamp);
+      _armStrandedConversationLoadingTimer(sid, loadingStamp, _loadGeneration);
+    }
   }
   // Phase 1: Load metadata only (~1KB) for fast session switching. Keep model
   // resolution out of the first-paint path; old provider-shaped model IDs are
