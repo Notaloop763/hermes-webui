@@ -1812,7 +1812,12 @@ async function cmdLearn(args){
       if((inp.value||'').trim()){showToast(t('learn_failed')+t('learn_composer_busy'));return;}
       inp.value=prompt;if(typeof autoResize==='function')autoResize();
     }
-    if(typeof send==='function'){await send();}
+    // Submit the generated prompt as the wire payload but display the
+    // original /learn invocation in the transcript (mirrors the /moa +
+    // bundle _slashDisplayTextOverride path in send()). Passed as a send()
+    // option so it stays scoped to this submission.
+    const invocation='/learn'+(request?' '+request:'');
+    if(typeof send==='function'){await send({displayText:invocation});}
   }catch(e){showToast(t('learn_failed')+(e&&e.message||e));}
 }
 

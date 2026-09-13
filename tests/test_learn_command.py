@@ -66,14 +66,17 @@ def _run_learn_harness(api_js, test_js, composer_initial=""):
     """Load the REAL commands.js with mocked globals, run test_js, return its result.
 
     Mock browser state: S (session sid-1), $('msg') composer element backed by
-    __state.composer, send()/showToast()/api() record into __sendCount/__toasts/
-    __calls. api_js is harness-scope JS (may close over S/state); test_js runs
-    INSIDE the vm and must read results via the __-prefixed ctx globals.
-    Assumption (matches the real dispatcher): cmdLearn is invoked with the
-    composer already cleared (static/messages.js send() runs the handler then
-    synchronously sets $('msg').value='' without awaiting), so
-    composer_initial="" is the post-dispatch state and any non-empty composer
-    observed after the api await is a user draft typed mid-request.
+    __state.composer, send()/showToast()/api() record into __sendCount/__sendOpts/
+    __toasts/__calls. api_js is harness-scope JS (may close over S/state); test_js
+    runs INSIDE the vm and must read results via the __-prefixed ctx globals.
+    Dispatch ordering mirrors the real slash branch (static/messages.js send()):
+    the handler is invoked WITHOUT await and the composer is cleared
+    synchronously right after, so tests fire entry.fn(...) then set
+    __state.composer='' before awaiting. Any non-empty composer observed after
+    the api await is therefore a user draft typed mid-request. api mocks yield
+    one microtask (await Promise.resolve()) before resolving so the
+    synchronous dispatcher clear lands before the in-flight request settles —
+    matching the real round-trip order.
     """
     node = _node()
     harness = (
@@ -81,6 +84,7 @@ def _run_learn_harness(api_js, test_js, composer_initial=""):
         "const __calls = [];\n"
         "const __toasts = [];\n"
         "const __sendCount = {n: 0};\n"
+        "const __sendOpts = [];\n"
         "const __state = {composer: " + json.dumps(composer_initial) + "};\n"
         "const S = {session: {session_id: 'sid-1'}, pendingFiles: []};\n"
         "const composerEl = {};\n"
@@ -95,9 +99,9 @@ def _run_learn_harness(api_js, test_js, composer_initial=""):
         "  $: (id) => (id === 'msg' ? composerEl : null),\n"
         "  autoResize(){},\n"
         "  showToast(msg){ __toasts.push(String(msg)); },\n"
-        "  send: async () => { __sendCount.n++; },\n"
+        "  send: async (opts) => { __sendCount.n++; __sendOpts.push(opts || null); },\n"
         "  api: __api,\n"
-        "  __calls, __toasts, __sendCount, __state,\n"
+        "  __calls, __toasts, __sendCount, __sendOpts, __state,\n"
         "};\n"
         "vm.createContext(ctx);\n"
         "vm.runInContext(" + json.dumps(COMMANDS_JS) + ", ctx);\n"
@@ -118,7 +122,18 @@ def _run_learn_harness(api_js, test_js, composer_initial=""):
 
 HAPPY_API_JS = (
     "__calls.push({path, body: JSON.parse(opts.body)});\n"
+    "await Promise.resolve();\n"
     "return {prompt: '[/learn] generated prompt'};"
+)
+
+# Fire the handler exactly like the real slash branch: no await, then the
+# synchronous dispatcher clear (static/messages.js runs _cmd.fn(...) then
+# sets $('msg').value='' without awaiting).
+DISPATCH_JS = (
+    "const entry = COMMANDS.find(c => c.name === 'learn');"
+    " const p = entry.fn('my request');"
+    " __state.composer = '';"
+    " await p;"
 )
 
 
@@ -144,16 +159,21 @@ def test_learn_dispatched_through_command_table():
 
 
 def test_cmd_learn_sends_prompt_through_chat_pipeline():
-    """Happy path: POSTs the request, fills the composer, calls send()."""
+    """Happy path: POSTs the request, then submits prompt-as-payload with
+    the /learn invocation as the display text (payload/display separation)."""
     result = _run_learn_harness(
         HAPPY_API_JS,
-        "await cmdLearn('my request');"
+        DISPATCH_JS +
         " return {composer: __state.composer, sendCalls: __sendCount.n,"
-        "  toasts: __toasts, apiCalls: __calls};",
+        "  sendOpts: __sendOpts, toasts: __toasts, apiCalls: __calls};",
     )
     assert result["apiCalls"] == [{"path": "/api/learn", "body": {"request": "my request"}}]
     assert result["composer"] == "[/learn] generated prompt"
     assert result["sendCalls"] == 1
+    assert result["sendOpts"] == [{"displayText": "/learn my request"}]
+    assert result["sendOpts"][0]["displayText"] != result["composer"], (
+        "the transcript row must show the /learn invocation, not the prompt"
+    )
     assert result["toasts"] == []
 
 
@@ -165,13 +185,16 @@ def test_cmd_learn_preserves_draft_typed_during_request():
     """
     result = _run_learn_harness(
         "__calls.push({path});"
+        " await Promise.resolve();"
         " __state.composer = 'user draft typed during request';"
         " return {prompt: '[/learn] generated prompt'};",
-        "await cmdLearn('my request');"
-        " return {composer: __state.composer, sendCalls: __sendCount.n, toasts: __toasts};",
+        DISPATCH_JS +
+        " return {composer: __state.composer, sendCalls: __sendCount.n,"
+        "  sendOpts: __sendOpts, toasts: __toasts};",
     )
     assert result["composer"] == "user draft typed during request"
     assert result["sendCalls"] == 0
+    assert result["sendOpts"] == []
     assert any("learn_composer_busy" in toast for toast in result["toasts"]), (
         "expected a composer-busy toast preserving the draft"
     )
@@ -181,13 +204,16 @@ def test_cmd_learn_aborts_when_session_changes_during_request():
     """The prompt must not be submitted into a different session than the caller's."""
     result = _run_learn_harness(
         "__calls.push({path});"
+        " await Promise.resolve();"
         " S.session.session_id = 'sid-2';"
         " return {prompt: '[/learn] generated prompt'};",
-        "await cmdLearn('my request');"
-        " return {composer: __state.composer, sendCalls: __sendCount.n, toasts: __toasts};",
+        DISPATCH_JS +
+        " return {composer: __state.composer, sendCalls: __sendCount.n,"
+        "  sendOpts: __sendOpts, toasts: __toasts};",
     )
     assert result["composer"] == ""
     assert result["sendCalls"] == 0
+    assert result["sendOpts"] == []
     assert any("learn_session_changed" in toast for toast in result["toasts"]), (
         "a session switch must abort with the session-changed toast, not the composer-busy one"
     )

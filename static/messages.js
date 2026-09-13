@@ -1469,6 +1469,13 @@ async function send(){
     return;
   }
   let _slashDisplayTextOverride=null;
+  // One-shot display override from the send() options argument (e.g. cmdLearn
+  // submits a generated prompt as the wire payload while displaying the
+  // original /learn invocation — the same separation the /moa + bundle paths
+  // get by rewriting text below). Scoped to this send() invocation via the
+  // options object, never a shared global, so an action interleaved during an
+  // await cannot steal or inherit it.
+  if(options&&typeof options.displayText==='string'&&options.displayText.trim()) _slashDisplayTextOverride=options.displayText;
   let _pendingMoaConfig=null;
   // Slash command intercept -- local commands handled without agent round-trip.
   // We push the user message BEFORE running the handler for echo-worthy
