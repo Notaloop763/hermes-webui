@@ -21,6 +21,52 @@ from tests.conftest import TEST_BASE, requires_agent_modules
 ROOT = Path(__file__).resolve().parents[1]
 COMMANDS_JS = (ROOT / "static" / "commands.js").read_text(encoding="utf-8")
 I18N_JS = (ROOT / "static" / "i18n.js").read_text(encoding="utf-8")
+MESSAGES_JS = (ROOT / "static" / "messages.js").read_text(encoding="utf-8")
+UI_JS = (ROOT / "static" / "ui.js").read_text(encoding="utf-8")
+
+
+def _extract_js_function(source: str, name: str) -> str:
+    """Slice a self-contained top-level `function name(...) {...}` from REAL JS source.
+
+    String/comment-aware brace matching, so the returned text is the actual
+    shipped implementation — not a copy. Raises (failing the test) when the
+    function is absent, which is the pre-fix behavior for new helpers.
+    """
+    marker = "function %s(" % name
+    start = source.find(marker)
+    if start < 0:
+        raise AssertionError("real JS function %s not found in source" % name)
+    i = source.find("{", start)
+    depth = 0
+    n = len(source)
+    while i < n:
+        ch = source[i]
+        if ch in "'\"`":
+            quote = ch
+            i += 1
+            while i < n:
+                if source[i] == "\\":
+                    i += 2
+                    continue
+                if source[i] == quote:
+                    break
+                i += 1
+        elif ch == "/" and i + 1 < n and source[i + 1] == "/":
+            while i < n and source[i] != "\n":
+                i += 1
+            continue
+        elif ch == "/" and i + 1 < n and source[i + 1] == "*":
+            end = source.find("*/", i + 2)
+            i = n if end == -1 else end + 2
+            continue
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return source[start:i + 1]
+        i += 1
+    raise AssertionError("unbalanced braces extracting real JS function %s" % name)
 
 
 # ── Backend: POST /api/learn route ────────────────────────────────────────────
@@ -275,3 +321,239 @@ def test_learn_i18n_keys_resolve_in_en_locale():
     assert result["resolved"] == result["learn_composer_busy"], (
         "t('learn_composer_busy') must resolve through the live locale fallback chain"
     )
+
+
+# ── Frontend: queued-turn display separation (real queue fns in node vm) ──────
+#
+# Greptile P2: a /learn turn queued while busy must keep its payload/display
+# separation — the queued-message state must preserve the display override and
+# the drain must pass it back into send(). Full send()/setBusy() cannot load
+# in node vm (DOM-heavy files), so these tests execute the REAL extracted
+# functions (_withDisplayOverride from static/messages.js, queueSessionMessage
+# + shiftQueuedSessionMessage from static/ui.js) with stubbed storage, and run
+# the /learn busy round-trip end-to-end through the REAL cmdLearn. The
+# send-queue shim mirrors the concurrent/busy branch of the real send()
+# (queue the composer payload via _withDisplayOverride on the hoisted option)
+# and the drain snippet mirrors the real setBusy() drain (shift → composer →
+# send through next.displayText); pinned line refs live in each docstring so
+# drift is detectable by review.
+
+
+def _run_queue_harness(test_js):
+    """Run test_js with the REAL queue-state functions and stubbed storage.
+
+    Stubs mirror the storage contract: _persistSessionQueueStorage JSON-rounds
+    the queue (as the real sessionStorage/localStorage persist does), so a
+    surviving displayText proves it is a plain persisted string, not a live
+    reference.
+    """
+    node = _node()
+    prelude = (
+        "const __persisted = {};\n"
+        "const SESSION_QUEUES = {};\n"
+        "function _getSessionQueue(sid, create){\n"
+        "  if(!SESSION_QUEUES[sid]){\n"
+        "    if(!create) return [];\n"
+        "    SESSION_QUEUES[sid] = [];\n"
+        "    const raw = __persisted[sid];\n"
+        "    if(raw){ try{ SESSION_QUEUES[sid] = JSON.parse(raw); }catch(_){} }\n"
+        "  }\n"
+        "  return SESSION_QUEUES[sid];\n"
+        "}\n"
+        "function _persistSessionQueueStorage(sid, q){ __persisted[sid] = JSON.stringify(q); }\n"
+        "function _clearPersistedSessionQueue(sid){ delete __persisted[sid]; }\n"
+        + _extract_js_function(MESSAGES_JS, "_withDisplayOverride") + "\n"
+        + _extract_js_function(UI_JS, "queueSessionMessage") + "\n"
+        + _extract_js_function(UI_JS, "shiftQueuedSessionMessage") + "\n"
+    )
+    harness = (
+        "const vm = require('vm');\n"
+        "const ctx = {console};\n"
+        "vm.createContext(ctx);\n"
+        "vm.runInContext(" + json.dumps(prelude) + ", ctx);\n"
+        "const result = vm.runInContext(\"(function(){ " + test_js + " })()\", ctx);\n"
+        "process.stdout.write(JSON.stringify(result));\n"
+    )
+    with tempfile.NamedTemporaryFile("w", suffix=".js", encoding="utf-8", delete=False) as handle:
+        handle.write(harness)
+        script_path = Path(handle.name)
+    try:
+        proc = subprocess.run([node, str(script_path)], check=True, capture_output=True, text=True, timeout=60)
+    finally:
+        script_path.unlink(missing_ok=True)
+    return json.loads(proc.stdout)
+
+
+def test_with_display_override_merges_only_nonblank():
+    """The REAL _withDisplayOverride keeps the override out unless non-blank."""
+    result = _run_queue_harness(
+        "const base = {text: 'GEN', files: [], model: 'm', model_provider: 'p', profile: 'd'};"
+        " return {"
+        "  merged: _withDisplayOverride(base, '/learn my request'),"
+        "  blank: _withDisplayOverride(base, '   '),"
+        "  missing: _withDisplayOverride(base),"
+        "  nullPayload: _withDisplayOverride(null, '/learn x')};"
+    )
+    assert result["merged"] == {
+        "text": "GEN", "files": [], "model": "m", "model_provider": "p",
+        "profile": "d", "displayText": "/learn my request",
+    }
+    for key in ("blank", "missing"):
+        assert result[key] == {
+            "text": "GEN", "files": [], "model": "m", "model_provider": "p", "profile": "d",
+        }, "a blank/missing override must leave the payload unchanged"
+    assert result["nullPayload"] is None
+
+
+def test_queue_state_preserves_display_override():
+    """The REAL queue fns must carry displayText through enqueue→persist→shift."""
+    result = _run_queue_harness(
+        "const n0 = queueSessionMessage('sid-1',"
+        " _withDisplayOverride({text: '[/learn] generated prompt', files: [],"
+        "  model: 'm', model_provider: 'p', profile: 'default'}, '/learn my request'));"
+        " const persisted = JSON.parse(__persisted['sid-1']);"
+        " const next = shiftQueuedSessionMessage('sid-1');"
+        " return {queued: n0, persistedEntry: persisted[0], drained: next,"
+        "  queueGone: !('sid-1' in SESSION_QUEUES),"
+        "  persistedCleared: !('sid-1' in __persisted)};"
+    )
+    assert result["queued"] == 1
+    assert result["persistedEntry"]["text"] == "[/learn] generated prompt"
+    assert result["persistedEntry"]["displayText"] == "/learn my request", (
+        "the display override must survive the JSON persist round-trip"
+    )
+    assert result["drained"]["text"] == "[/learn] generated prompt"
+    assert result["drained"]["displayText"] == "/learn my request"
+    assert result["queueGone"] and result["persistedCleared"]
+
+
+def _run_learn_queue_harness(api_js, test_js):
+    """REAL cmdLearn + REAL queue fns, with a send-shim for the busy branch.
+
+    The shim mirrors static/messages.js send(): while __busy it queues the
+    composer payload via the REAL _withDisplayOverride/queueSessionMessage;
+    otherwise it records the submitted {payload, display} turn. The drain
+    snippet in test_js mirrors static/ui.js setBusy(): shift the entry,
+    restore the composer, send through next.displayText. The REAL extracted
+    functions are evaluated once in a prelude vm context and shared by
+    reference with both the main ctx and the Node-side send closure (a vm
+    function keeps its own globals, and the storage stubs operate on the
+    shared __persisted/SESSION_QUEUES objects).
+    """
+    node = _node()
+    stubs = (
+        "const __persisted = {};\n"
+        "const SESSION_QUEUES = {};\n"
+        "function _getSessionQueue(sid, create){\n"
+        "  if(!SESSION_QUEUES[sid]){\n"
+        "    if(!create) return [];\n"
+        "    SESSION_QUEUES[sid] = [];\n"
+        "    const raw = __persisted[sid];\n"
+        "    if(raw){ try{ SESSION_QUEUES[sid] = JSON.parse(raw); }catch(_){} }\n"
+        "  }\n"
+        "  return SESSION_QUEUES[sid];\n"
+        "}\n"
+        "function _persistSessionQueueStorage(sid, q){ __persisted[sid] = JSON.stringify(q); }\n"
+        "function _clearPersistedSessionQueue(sid){ delete __persisted[sid]; }\n"
+    )
+    real_fns = (
+        _extract_js_function(MESSAGES_JS, "_withDisplayOverride") + "\n"
+        + _extract_js_function(UI_JS, "queueSessionMessage") + "\n"
+        + _extract_js_function(UI_JS, "shiftQueuedSessionMessage") + "\n"
+    )
+    harness = (
+        "const vm = require('vm');\n"
+        + stubs +
+        "const __prelude = {console, __persisted, SESSION_QUEUES,"
+        " _getSessionQueue, _persistSessionQueueStorage, _clearPersistedSessionQueue};\n"
+        "vm.createContext(__prelude);\n"
+        "vm.runInContext(" + json.dumps(real_fns) + ", __prelude);\n"
+        "const queueSessionMessage = __prelude.queueSessionMessage;\n"
+        "const shiftQueuedSessionMessage = __prelude.shiftQueuedSessionMessage;\n"
+        "const _withDisplayOverride = __prelude._withDisplayOverride;\n"
+        "const __calls = [];\n"
+        "const __toasts = [];\n"
+        "const __sendCount = {n: 0};\n"
+        "const __sendOpts = [];\n"
+        "const __sent = [];\n"
+        "const __busy = {v: false};\n"
+        "const __state = {composer: ''};\n"
+        "const S = {session: {session_id: 'sid-1'}, pendingFiles: []};\n"
+        "const composerEl = {};\n"
+        "Object.defineProperty(composerEl, 'value', {"
+        "get(){return __state.composer;}, set(v){__state.composer = v;}, configurable: true});\n"
+        "async function __api(" + "path, opts" + ") {\n" + api_js + "\n}\n"
+        "const ctx = {\n"
+        "  console,\n"
+        "  localStorage: {getItem(){return null;}, setItem(){}, removeItem(){}},\n"
+        "  t: (key) => key,\n"
+        "  S,\n"
+        "  $: (id) => (id === 'msg' ? composerEl : null),\n"
+        "  autoResize(){},\n"
+        "  showToast(msg){ __toasts.push(String(msg)); },\n"
+        "  send: async (opts) => {\n"
+        "    __sendCount.n++; __sendOpts.push(opts || null);\n"
+        "    if (__busy.v) {\n"
+        "      queueSessionMessage('sid-1', _withDisplayOverride({text: __state.composer,"
+        " files: [], model: 'm', model_provider: 'p', profile: 'default'}, opts && opts.displayText));\n"
+        "      return;\n"
+        "    }\n"
+        "    __sent.push({payload: __state.composer, display: (opts && opts.displayText) || null});\n"
+        "  },\n"
+        "  api: __api,\n"
+        "  queueSessionMessage, shiftQueuedSessionMessage, _withDisplayOverride,\n"
+        "  __persisted, SESSION_QUEUES,\n"
+        "  __calls, __toasts, __sendCount, __sendOpts, __sent, __busy, __state,\n"
+        "};\n"
+        "vm.createContext(ctx);\n"
+        "vm.runInContext(" + json.dumps(COMMANDS_JS) + ", ctx);\n"
+        "(async () => {\n"
+        "  const result = await vm.runInContext(\"(async () => { " + test_js + " })()\", ctx);\n"
+        "  process.stdout.write(JSON.stringify(result));\n"
+        "})().catch(err => { console.error(err && err.stack || err); process.exit(1); });\n"
+    )
+    with tempfile.NamedTemporaryFile("w", suffix=".js", encoding="utf-8", delete=False) as handle:
+        handle.write(harness)
+        script_path = Path(handle.name)
+    try:
+        proc = subprocess.run([node, str(script_path)], check=True, capture_output=True, text=True, timeout=60)
+    finally:
+        script_path.unlink(missing_ok=True)
+    return json.loads(proc.stdout)
+
+
+# Drain snippet mirroring the real setBusy() drain: shift the queued entry,
+# restore the composer from its wire text, and re-send through its display
+# override (plain queued text re-sends unchanged).
+DRAIN_JS = (
+    "const next = shiftQueuedSessionMessage('sid-1');"
+    " __state.composer = (next && next.text) || '';"
+    " __busy.v = false;"
+    " await send((next && typeof next.displayText === 'string' && next.displayText.trim())"
+    "  ? {displayText: next.displayText} : undefined);"
+)
+
+
+def test_learn_queued_while_busy_keeps_invocation_display():
+    """Busy round-trip: the drained turn sends the prompt but shows /learn.
+
+    Fails pre-fix: without _withDisplayOverride the queued entry carries no
+    displayText (extraction itself fails), so the drained turn would display
+    the internal generated prompt in the transcript.
+    """
+    result = _run_learn_queue_harness(
+        HAPPY_API_JS,
+        "__busy.v = true;"
+        + DISPATCH_JS +
+        DRAIN_JS +
+        " return {sent: __sent, sendOpts: __sendOpts, toasts: __toasts};",
+    )
+    assert result["toasts"] == []
+    assert result["sendOpts"] == [
+        {"displayText": "/learn my request"},
+        {"displayText": "/learn my request"},
+    ], "both the queued submit and the drained re-send must carry the invocation"
+    assert result["sent"] == [
+        {"payload": "[/learn] generated prompt", "display": "/learn my request"}
+    ]
+    assert result["sent"][0]["payload"] != result["sent"][0]["display"]

@@ -1346,8 +1346,26 @@ function _restoreComposerDraftAfterFailedSend(draftText, filesSnapshot, sid, cle
 
   return restoredVisible;
 }
-
+// Merge a one-shot display override (e.g. a /learn invocation) into a
+// queued-message payload so a turn queued while busy keeps its
+// payload/display separation through the queue drain. Queue entries are
+// JSON-persisted and displayText is a plain string, so it survives the
+// round-trip. Blank/missing override → payload unchanged.
+function _withDisplayOverride(payload, displayText){
+  if(!payload) return payload;
+  return (typeof displayText==='string'&&displayText.trim())?{...payload,displayText}:payload;
+}
 async function send(){
+  // One-shot display override from the send() options argument (e.g. cmdLearn
+  // submits a generated prompt as the wire payload while displaying the
+  // original /learn invocation — the same separation the /moa + bundle paths
+  // get by rewriting text below). Captured BEFORE the concurrent/busy queue
+  // branches so a queued turn carries it into the queued-message state via
+  // _withDisplayOverride. Scoped to this send() invocation via the options
+  // object, never a shared global, so an action interleaved during an await
+  // cannot steal or inherit it.
+  const _sendOptions=arguments[0]||{};
+  const _sendDisplayText=(_sendOptions&&typeof _sendOptions.displayText==='string'&&_sendOptions.displayText.trim())?_sendOptions.displayText:null;
   // Static guards expect _defaultMessageMode to stay near send() while the actual
   // read remains in the S.busy branch below.
   // _defaultMessageMode
@@ -1361,7 +1379,7 @@ async function send(){
     const _targetSid=_sendInProgressSid||(S.session&&S.session.session_id);
     if(_text && _targetSid){
       const _modelState=_chatPayloadModelState();
-      queueSessionMessage(_targetSid,{text:_text,files:[...S.pendingFiles],model:_modelState.model,model_provider:_modelState.model_provider,profile:S.activeProfile||'default'});
+      queueSessionMessage(_targetSid,_withDisplayOverride({text:_text,files:[...S.pendingFiles],model:_modelState.model,model_provider:_modelState.model_provider,profile:S.activeProfile||'default'},_sendDisplayText));
       _clearComposerAfterQueuedSelectionSend();
       if(_targetSid&&typeof _clearComposerDraft==='function'&&_targetSid!==(S.session&&S.session.session_id)) _clearComposerDraft(_targetSid,_text,S.pendingFiles?[...S.pendingFiles]:[]);
       S.pendingFiles=[];renderTray();
@@ -1441,7 +1459,7 @@ async function send(){
       } else if(defaultMessageMode==='interrupt'){
         // Queue the message, then cancel so drain re-sends it.
         const _modelState=_chatPayloadModelState();
-        queueSessionMessage(S.session.session_id,{text,files:[...S.pendingFiles],model:_modelState.model,model_provider:_modelState.model_provider,profile:S.activeProfile||'default'});
+        queueSessionMessage(S.session.session_id,_withDisplayOverride({text,files:[...S.pendingFiles],model:_modelState.model,model_provider:_modelState.model_provider,profile:S.activeProfile||'default'},_sendDisplayText));
         updateQueueBadge(S.session.session_id);
         _clearComposerAfterQueuedSelectionSend(S.session&&S.session.session_id);
         S.pendingFiles=[];renderTray();
@@ -1455,7 +1473,7 @@ async function send(){
         // Default: queue mode (current behavior). Also the fallback for
         // 'steer' mode when no stream is active or _trySteer is unavailable.
         const _modelState=_chatPayloadModelState();
-        queueSessionMessage(S.session.session_id,{text,files:[...S.pendingFiles],model:_modelState.model,model_provider:_modelState.model_provider,profile:S.activeProfile||'default'});
+        queueSessionMessage(S.session.session_id,_withDisplayOverride({text,files:[...S.pendingFiles],model:_modelState.model,model_provider:_modelState.model_provider,profile:S.activeProfile||'default'},_sendDisplayText));
         _clearComposerAfterQueuedSelectionSend(S.session&&S.session.session_id);
         S.pendingFiles=[];renderTray();
         updateQueueBadge(S.session.session_id);
@@ -1468,14 +1486,9 @@ async function send(){
     if(typeof showToast==='function') showToast('Read-only imported sessions cannot be modified.',3000);
     return;
   }
-  let _slashDisplayTextOverride=null;
-  // One-shot display override from the send() options argument (e.g. cmdLearn
-  // submits a generated prompt as the wire payload while displaying the
-  // original /learn invocation — the same separation the /moa + bundle paths
-  // get by rewriting text below). Scoped to this send() invocation via the
-  // options object, never a shared global, so an action interleaved during an
-  // await cannot steal or inherit it.
-  if(options&&typeof options.displayText==='string'&&options.displayText.trim()) _slashDisplayTextOverride=options.displayText;
+  // Display override captured above (before the queue branches) now takes
+  // effect on the normal send path.
+  let _slashDisplayTextOverride=_sendDisplayText;
   let _pendingMoaConfig=null;
   // Slash command intercept -- local commands handled without agent round-trip.
   // We push the user message BEFORE running the handler for echo-worthy

@@ -8492,7 +8492,11 @@ function setBusy(v){
         }
         autoResize();
         renderTray();
-        send();
+        // A queued turn may carry a one-shot display override (e.g. /learn:
+        // wire payload is the generated prompt, transcript shows the
+        // invocation). Pass it through so the drained turn keeps the
+        // payload/display separation; plain queued text sends unchanged.
+        send((next&&typeof next.displayText==='string'&&next.displayText.trim())?{displayText:next.displayText}:undefined);
       },120);
     }
   }
