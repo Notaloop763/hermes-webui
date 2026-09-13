@@ -33,6 +33,7 @@ const COMMANDS=[
   {name:'reasoning', desc:t('cmd_reasoning'), fn:cmdReasoning, arg:'show|hide|none|minimal|low|medium|high|xhigh|max', subArgs:['show','hide','none','minimal','low','medium','high','xhigh','max'], noEcho:true},
   {name:'yolo', desc:t('cmd_yolo'), fn:cmdYolo, noEcho:true},
   {name:'branch', desc:t('cmd_branch'), fn:cmdBranch, arg:'[name]', noEcho:true},
+  {name:'learn', desc:t('cmd_learn'), fn:cmdLearn, arg:'what to learn from', noEcho:true},
 ];
 
 const SLASH_SUBARG_SOURCES={
@@ -1791,6 +1792,22 @@ async function cmdBtw(args){
     if(typeof attachBtwStream==='function') attachBtwStream(parentSid,streamId,question);
   }catch(e){showToast(t('btw_failed')+e.message);}
 }
+// /learn — build the learn prompt server-side, then run it through the normal
+// chat pipeline (mirrors the CLI/gateway behavior: the live agent gathers the
+// material with its tools and authors the skill via skill_manage).
+async function cmdLearn(args){
+  if(!S.session){showToast(t('no_active_session'));return;}
+  const request=(args||'').trim();
+  try{
+    const r=await api('/api/learn',{method:'POST',body:JSON.stringify({request})});
+    const prompt=r&&r.prompt;
+    if(!prompt){showToast(t('learn_failed')+t('learn_no_prompt'));return;}
+    const inp=$('msg');
+    if(inp){inp.value=prompt;if(typeof autoResize==='function')autoResize();}
+    if(typeof send==='function'){await send();}
+  }catch(e){showToast(t('learn_failed')+(e&&e.message||e));}
+}
+
 async function cmdBackground(args){
   if(!S.session){showToast(t('no_active_session'));return;}
   const prompt=(args||'').trim();
@@ -2284,3 +2301,4 @@ function selectCmdDropdownItem(){
 // allow tooling and tests to discover command handlers by name independently.
 const HANDLERS = {};
 HANDLERS.skills = cmdSkills;
+HANDLERS.learn = cmdLearn;
