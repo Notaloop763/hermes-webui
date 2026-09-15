@@ -100,6 +100,23 @@ function _settleStrandedConversationLoading(settleSid, expectedStamp, expectedGe
 function _armStrandedConversationLoadingTimer(sid, loadingStamp, loadGeneration){
   setTimeout(() => _settleStrandedConversationLoading(sid, loadingStamp, loadGeneration), _SESSION_LOAD_IN_FLIGHT_MAX_MS);
 }
+// Same-session force-reload re-arm for the stranded placeholder (Retry-click
+// force path over a still-visible Loading placeholder). Extracted from
+// loadSession's preamble so the Node harness drives the REAL production
+// branch behaviorally under a fake clock: it re-stamps the placeholder and
+// arms a new expiry timer with the new generation, transferring ownership
+// to the new attempt. Returns true only when the re-stamp + re-arm ran.
+function _restampStrandedPlaceholderForReload(sid, loadGeneration, sameSessionForceReload){
+  if (!sameSessionForceReload) return false;
+  const _msgInner = $('msgInner');
+  if (!_msgInner || !_msgInner.dataset ||
+      typeof _msgInner.textContent !== 'string' ||
+      _msgInner.textContent.indexOf('Loading conversation') === -1) return false;
+  const loadingStamp = Date.now();
+  _msgInner.dataset.conversationLoadingSince = String(loadingStamp);
+  _armStrandedConversationLoadingTimer(sid, loadingStamp, loadGeneration);
+  return true;
+}
 // Each loadSession() invocation gets a monotonically increasing generation.
 // `_loadingSessionId` only tracks destination session_id, so same-session
 // concurrent loads can still race and overwrite each other unless we compare
@@ -1963,14 +1980,9 @@ async function loadSession(sid){
     // strand still shows "Loading conversation" and correctly re-arms here
     // (the pane is still Loading, so it still needs a timer); a keep-stale
     // reload with the old transcript visible shows no Loading text and
-    // correctly skips.
-    if (sameSessionForceReload && _msgInner && _msgInner.dataset &&
-        typeof _msgInner.textContent === 'string' &&
-        _msgInner.textContent.indexOf('Loading conversation') !== -1) {
-      const loadingStamp = Date.now();
-      _msgInner.dataset.conversationLoadingSince = String(loadingStamp);
-      _armStrandedConversationLoadingTimer(sid, loadingStamp, _loadGeneration);
-    }
+    // correctly skips. Routed through _restampStrandedPlaceholderForReload so
+    // the regression harness drives this exact production branch.
+    _restampStrandedPlaceholderForReload(sid, _loadGeneration, sameSessionForceReload);
   }
   // Phase 1: Load metadata only (~1KB) for fast session switching. Keep model
   // resolution out of the first-paint path; old provider-shaped model IDs are

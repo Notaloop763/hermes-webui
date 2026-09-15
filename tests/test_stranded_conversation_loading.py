@@ -1,13 +1,15 @@
 """Node-harness behavior tests for stranded conversation loading settlement.
 
 The in-flight latch helpers (``_conversationLoadingAgeMs`` /
-``_sessionLoadInFlightFor``) and the escape hatch
-(``_settleStrandedConversationLoading``) are extracted verbatim from
+``_sessionLoadInFlightFor``), the escape hatch
+(``_settleStrandedConversationLoading``), the expiry armer
+(``_armStrandedConversationLoadingTimer``), and the same-session force-reload
+re-arm (``_restampStrandedPlaceholderForReload``) are extracted verbatim from
 ``static/sessions.js`` and exercised under node with hand-rolled DOM shims
 (no JSDOM). Every assertion is on observable behavior — helper return values,
-innerHTML writes, and retry-click dispatch — plus two narrow source-structure
-pins where a behavior harness cannot reach production wiring (arm deadline,
-force-reload re-arm).
+innerHTML writes, dataset re-stamps, scheduled-callback delays, and
+retry-click dispatch — plus one narrow source-structure pin where a behavior
+harness cannot reach production wiring (arm deadline).
 """
 
 from __future__ import annotations
@@ -75,7 +77,7 @@ def _extract_function(source: str, name: str) -> str:
         if ch == "/" and nxt == "*":
             in_block_comment = True
             continue
-        if ch in ('\'', '"', "`"):
+        if ch in ("'", '"', "`"):
             in_string = ch
             continue
 
@@ -111,10 +113,12 @@ SETTLE_STRANDED_CONVERSATION_LOADING_SRC = _extract_function(
 ARM_STRANDED_TIMER_SRC = _extract_function(
     SESSIONS_SRC, "_armStrandedConversationLoadingTimer"
 )
-LOAD_SESSION_SRC = _extract_function(SESSIONS_SRC, "loadSession")
+RESTAMP_STRANDED_PLACEHOLDER_SRC = _extract_function(
+    SESSIONS_SRC, "_restampStrandedPlaceholderForReload"
+)
 
 
-_NODE_SCRIPT = r'''
+_NODE_SCRIPT = r"""
 const M = { loadCalls: [] };
 
 function makeMsgInner({ text, stamp }) {
@@ -218,7 +222,7 @@ const results = {
 };
 
 console.log(JSON.stringify(results));
-'''
+"""
 
 
 def _build_script() -> str:
@@ -247,7 +251,9 @@ def _run_node(script: str) -> dict:
     assert completed.returncode == 0, (
         f"node subprocess failed:\n--- stdout ---\n{completed.stdout}\n--- stderr ---\n{completed.stderr}"
     )
-    output_lines = [line.strip() for line in completed.stdout.splitlines() if line.strip()]
+    output_lines = [
+        line.strip() for line in completed.stdout.splitlines() if line.strip()
+    ]
     assert output_lines, (
         f"node produced no parseable output\nstdout={completed.stdout}\nstderr={completed.stderr}"
     )
@@ -297,9 +303,7 @@ def test_settle_writes_retry_only_when_stranded():
         assert case["wroteRetry"] is False, (
             f"{label}: the pane must be left untouched (no retry written)"
         )
-        assert case["loadCalls"] == [], (
-            f"{label}: no Retry handler may be installed"
-        )
+        assert case["loadCalls"] == [], f"{label}: no Retry handler may be installed"
 
 
 @pytest.mark.skipif(NODE is None, reason="node not on PATH")
@@ -313,9 +317,7 @@ def test_overlapping_timer_does_not_clobber_newer_load():
     assert case["textContentAfter"].find("Loading conversation") != -1, (
         "the pane must still show the newer load's Loading text"
     )
-    assert case["loadCalls"] == [], (
-        "Retry must not fire for a superseded timer"
-    )
+    assert case["loadCalls"] == [], "Retry must not fire for a superseded timer"
 
 
 @pytest.mark.skipif(NODE is None, reason="node not on PATH")
@@ -339,7 +341,7 @@ def test_timer_with_matching_stamp_writes_retry():
 # clock: no Retry at 4s, Retry at the expiry boundary, stale callbacks leave
 # newer placeholders untouched, and metadata-without-messages still settles.
 
-_NODE_TIMER_SCRIPT = r'''
+_NODE_TIMER_SCRIPT = r"""
 const M2 = { loadCalls: [] };
 let nowMs = 1000000;
 Date.now = () => nowMs;
@@ -408,6 +410,7 @@ __CONVERSATION_LOADING_AGE_MS_SRC__
 __SESSION_LOAD_IN_FLIGHT_FOR_SRC__
 __SETTLE_STRANDED_CONVERSATION_LOADING_SRC__
 __ARM_STRANDED_TIMER_SRC__
+__RESTAMP_STRANDED_PLACEHOLDER_SRC__
 
 function retryWritten() {
   return timerInner._html.indexOf('conversationLoadRetry') !== -1;
@@ -475,19 +478,22 @@ const timerResults = {};
   timerResults.metaWithTranscriptStandsDown = !retryWritten();
 }
 
-// F (timer mechanics only — the re-arm here is hand-simulated; production
-// wiring is pinned by test_same_session_force_reload_rearm_pinned_in_load_session):
-// given a re-stamped + re-armed same-session reload, the original timer stands
+// F: same-session force reload (Retry click) that inherits the visible
+// Loading placeholder must re-stamp it and re-arm the expiry timer with the
+// new generation — driven through the REAL production re-arm branch
+// (_restampStrandedPlaceholderForReload, the exact function loadSession's
+// preamble now calls), not a hand simulation. The original timer then stands
 // down at its expiry (stamp+generation mismatch) and the new timer settles.
 {
   installTimerEnv({ stamp: T0, loadingSid: 'sid-a', generation: 1, sessionId: 'sid-a', messages: [] });
   nowMs = T0;
   _armStrandedConversationLoadingTimer('sid-a', T0, 1);
-  // Same-session force reload at T0+5000: re-stamp, bump generation, re-arm.
+  // Same-session force reload at T0+5000 via the production branch: bump the
+  // generation the way loadSession's preamble does, then re-stamp + re-arm.
   nowMs = T0 + 5000;
-  timerInner.dataset.conversationLoadingSince = String(T0 + 5000);
   globalThis._loadSessionGeneration = 2;
-  _armStrandedConversationLoadingTimer('sid-a', T0 + 5000, 2);
+  timerResults.restampActed = _restampStrandedPlaceholderForReload('sid-a', 2, true);
+  timerResults.restampMovedStamp = timerInner.dataset.conversationLoadingSince === String(T0 + 5000);
   // Advance past the original expiry (T0+20000): original callback stands down.
   advance(15000); // nowMs = T0+20000
   timerResults.sameSessionForceReloadOriginalStandsDown = !retryWritten();
@@ -496,8 +502,39 @@ const timerResults = {};
   timerResults.sameSessionForceReloadNewSettles = retryWritten();
 }
 
+// G: the production re-arm branch must NOT arm on rendered or Retry panes —
+// only a still-visible Loading placeholder re-arms (skip matrix).
+{
+  installTimerEnv({ stamp: T0, loadingSid: 'sid-a', generation: 1, sessionId: 'sid-a', messages: [{ role: 'user', content: 'hi' }] });
+  timerInner._text = 'Already rendered transcript';
+  timerInner._html = '<div>transcript</div>';
+  nowMs = T0 + 5000;
+  globalThis._loadSessionGeneration = 2;
+  const actedRendered = _restampStrandedPlaceholderForReload('sid-a', 2, true);
+  timerResults.restampSkipsRendered = actedRendered === false && pendingTimers.length === 0;
+}
+{
+  installTimerEnv({ stamp: T0, loadingSid: 'sid-a', generation: 1, sessionId: 'sid-a', messages: [] });
+  timerInner._text = '';
+  timerInner._html = '<div>retry pane conversationLoadRetry</div>';
+  nowMs = T0 + 5000;
+  globalThis._loadSessionGeneration = 2;
+  const actedRetry = _restampStrandedPlaceholderForReload('sid-a', 2, true);
+  timerResults.restampSkipsRetry = actedRetry === false && pendingTimers.length === 0;
+}
+{
+  // Non-force same-session navigation over a Loading placeholder: no re-arm
+  // (the cross-session first-paint arm path owns that case).
+  installTimerEnv({ stamp: T0, loadingSid: 'sid-a', generation: 1, sessionId: 'sid-a', messages: [] });
+  nowMs = T0 + 5000;
+  globalThis._loadSessionGeneration = 2;
+  const actedNonForce = _restampStrandedPlaceholderForReload('sid-a', 2, false);
+  timerResults.restampSkipsNonForce = actedNonForce === false && pendingTimers.length === 0
+    && timerInner.dataset.conversationLoadingSince === String(T0);
+}
+
 console.log(JSON.stringify(timerResults));
-'''
+"""
 
 
 def _build_timer_script() -> str:
@@ -512,6 +549,9 @@ def _build_timer_script() -> str:
             SETTLE_STRANDED_CONVERSATION_LOADING_SRC,
         )
         .replace("__ARM_STRANDED_TIMER_SRC__", ARM_STRANDED_TIMER_SRC)
+        .replace(
+            "__RESTAMP_STRANDED_PLACEHOLDER_SRC__", RESTAMP_STRANDED_PLACEHOLDER_SRC
+        )
     )
 
 
@@ -519,8 +559,9 @@ def _build_timer_script() -> str:
 def test_expiry_timer_armed_at_deadline():
     """The arm path must schedule the real callback at the expiry deadline.
 
-    Guards the reviewed flaw: a 4s callback racing the 20s latch can never
-    settle, so production must arm at _SESSION_LOAD_IN_FLIGHT_MAX_MS.
+    The delay half is observable behavior (the fake clock records the real
+    scheduled delay); the constant half pins the reviewed flaw where a 4s
+    callback raced the 20s latch and could never settle.
     """
     assert "_SESSION_LOAD_IN_FLIGHT_MAX_MS" in ARM_STRANDED_TIMER_SRC, (
         "the arm helper must schedule at the expiry deadline"
@@ -580,49 +621,44 @@ def test_metadata_with_transcript_stands_down():
 
 
 @pytest.mark.skipif(NODE is None, reason="node not on PATH")
-def test_same_session_force_reload_rearm_pinned_in_load_session():
-    """loadSession must re-stamp + re-arm the timer on same-session force reload.
+def test_same_session_force_reload_rearms_through_production_branch():
+    """A Retry-click force reload over Loading re-stamps + re-arms (production branch).
 
-    Source-structure pin: the mechanics test below hand-simulates the re-arm, so
-    it cannot prove production performs it. This pins the production branch
-    itself — a ``sameSessionForceReload``-gated re-stamp of
-    ``conversationLoadingSince`` plus an ``_armStrandedConversationLoadingTimer``
-    call with the new generation, conditioned on the placeholder still showing
-    "Loading conversation" (so Retry/rendered panes never arm a timer).
-    """
-    m = re.search(
-        r"if\s*\(\s*sameSessionForceReload\b(.*?)\{\s*"
-        r"const loadingStamp\s*=\s*Date\.now\(\);\s*"
-        r"_msgInner\.dataset\.conversationLoadingSince\s*=\s*String\(loadingStamp\);\s*"
-        r"_armStrandedConversationLoadingTimer\(sid,\s*loadingStamp,\s*_loadGeneration\);",
-        LOAD_SESSION_SRC,
-        re.S,
-    )
-    assert m, (
-        "loadSession must re-stamp + re-arm the expiry timer on a same-session "
-        "force reload (forced reload otherwise loses its only timer)"
-    )
-    assert "Loading conversation" in m.group(1), (
-        "the re-arm must be conditioned on the Loading placeholder text so "
-        "Retry/rendered panes never arm a timer"
-    )
-
-
-@pytest.mark.skipif(NODE is None, reason="node not on PATH")
-def test_same_session_force_reload_timer_mechanics():
-    """Timer mechanics given a re-armed same-session reload (hand-simulated).
-
-    The original timer stands down at its expiry (stamp+generation mismatch
-    from the re-stamped, re-armed same-session reload), and the new timer
-    settles at its own expiry → Retry appears. This drives the extracted timer
-    helpers only; the production re-arm branch itself is pinned by
-    test_same_session_force_reload_rearm_pinned_in_load_session.
+    Drives the REAL production re-arm function that loadSession's preamble
+    calls (``_restampStrandedPlaceholderForReload``) under the fake clock:
+    the re-stamp must move the placeholder stamp, the original timer must
+    stand down at its expiry (stamp+generation mismatch), and the re-armed
+    timer must settle at its own expiry. Gutting the helper breaks this
+    without any source-text inspection.
     """
     body = _run_node(_build_timer_script())
+    assert body["restampActed"] is True, (
+        "the production re-arm branch must act on a same-session force "
+        "reload over a visible Loading placeholder"
+    )
+    assert body["restampMovedStamp"] is True, (
+        "the re-arm must re-stamp the placeholder to the new attempt's time"
+    )
     assert body["sameSessionForceReloadOriginalStandsDown"] is True, (
         "the original timer must stand down at its expiry (stamp+generation "
         "mismatch from the re-stamped, re-armed same-session reload)"
     )
     assert body["sameSessionForceReloadNewSettles"] is True, (
         "the re-armed timer must settle at its own expiry → Retry appears"
+    )
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_production_rearm_skips_rendered_retry_and_non_force_panes():
+    """The production re-arm branch arms a timer only for a Loading pane."""
+    body = _run_node(_build_timer_script())
+    assert body["restampSkipsRendered"] is True, (
+        "a rendered transcript must never re-arm a settlement timer"
+    )
+    assert body["restampSkipsRetry"] is True, (
+        "an already-settled Retry pane must never re-arm a settlement timer"
+    )
+    assert body["restampSkipsNonForce"] is True, (
+        "a non-force navigation must not re-arm (first-paint path owns it) "
+        "and must leave the live stamp untouched"
     )
