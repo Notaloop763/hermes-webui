@@ -15,7 +15,6 @@ harness cannot reach production wiring (arm deadline).
 from __future__ import annotations
 
 import json
-import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -92,15 +91,38 @@ def _extract_function(source: str, name: str) -> str:
 
 
 def _extract_const(source: str, name: str) -> str:
-    """Return the full ``const name = ...;`` declaration from a single js file."""
-    m = re.search(rf"const {name}\s*=\s*[^;]+;", source)
-    assert m, f"{name} not found in sessions.js"
-    return m.group(0)
+    """Return the full ``const name = ...;`` declaration from a single js file.
+
+    The value pattern tolerates semicolons inside single-quoted JS string
+    literals (e.g. ``'&amp;'``) by scanning to the first semicolon that is
+    not inside a string.
+    """
+    start = source.find(f"const {name}")
+    assert start >= 0, f"{name} not found in sessions.js"
+    in_string = None
+    escaped = False
+    for index in range(start, len(source)):
+        ch = source[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == in_string:
+                in_string = None
+            continue
+        if ch in ("'", '"', "`"):
+            in_string = ch
+            continue
+        if ch == ";":
+            return source[start : index + 1]
+    raise AssertionError(f"{name} declaration not terminated in sessions.js")
 
 
 SESSION_LOAD_IN_FLIGHT_MAX_MS_SRC = _extract_const(
     SESSIONS_SRC, "_SESSION_LOAD_IN_FLIGHT_MAX_MS"
 )
+RETRY_ESCAPES_SRC = _extract_const(SESSIONS_SRC, "_RETRY_ESCAPES")
 CONVERSATION_LOADING_AGE_MS_SRC = _extract_function(
     SESSIONS_SRC, "_conversationLoadingAgeMs"
 )
@@ -150,16 +172,27 @@ function makeMsgInner({ text, stamp }) {
   return el;
 }
 
-function installEnv({ text, stamp, loadingSid, sessionId }) {
+function installEnv({ text, stamp, loadingSid, sessionId, generation }) {
   const msgInner = makeMsgInner({ text, stamp });
   globalThis.$ = (id) => (id === 'msgInner' ? msgInner : null);
   globalThis._loadingSessionId = loadingSid;
+  if (generation !== undefined) globalThis._loadSessionGeneration = generation;
+  else delete globalThis._loadSessionGeneration;
   globalThis.S = { session: sessionId === null ? null : { session_id: sessionId } };
   globalThis.loadSession = (sid, opts) => { M.loadCalls.push({ sid, opts }); };
+  // The settle helper renders through t() in production; default to the
+  // English fallback strings so assertions stay behavioral, not locale-bound.
+  globalThis.t = (key) =>
+    key === 'conversation_load_failed'
+      ? 'Couldn\u2019t load this conversation.'
+      : key === 'conversation_load_retry'
+        ? 'Retry'
+        : key;
   return msgInner;
 }
 
 __SESSION_LOAD_IN_FLIGHT_MAX_MS_SRC__
+__RETRY_ESCAPES_SRC__
 __CONVERSATION_LOADING_AGE_MS_SRC__
 __SESSION_LOAD_IN_FLIGHT_FOR_SRC__
 __SETTLE_STRANDED_CONVERSATION_LOADING_SRC__
@@ -185,14 +218,23 @@ function runLatchScenarios() {
   return results;
 }
 
-function runSettleScenario({ text, stamp, loadingSid, sessionId, settleSid, expectedStamp }) {
+function runSettleScenario({
+  text,
+  stamp,
+  loadingSid,
+  sessionId,
+  settleSid,
+  expectedStamp,
+  expectedGeneration,
+  generation,
+}) {
   M.loadCalls.length = 0;
-  const inner = installEnv({ text, stamp, loadingSid, sessionId });
+  const inner = installEnv({ text, stamp, loadingSid, sessionId, generation });
   // The placeholder's live stamp is set by installEnv via makeMsgInner when
   // `stamp` is provided. The timer path passes expectedStamp separately —
   // do NOT overwrite the dataset with it; the whole point of the
   // stale-timer guard is that expectedStamp may differ from the live stamp.
-  _settleStrandedConversationLoading(settleSid, expectedStamp);
+  _settleStrandedConversationLoading(settleSid, expectedStamp, expectedGeneration);
   const wroteRetry = inner._innerHTML.indexOf('conversationLoadRetry') !== -1;
   if (inner._retryHandler) inner._retryHandler();
   return {
@@ -217,7 +259,26 @@ const results = {
     staleTimerSuperseded: runSettleScenario({ text: 'Loading conversation...', stamp: 1100, loadingSid: 'sid-b', sessionId: 'sid-other', settleSid: 'sid-a', expectedStamp: 1000 }),
     // Current-load timer fires with expectedStamp matching the live stamp, and the
     // load is stranded (past max-age / no live latch) → Retry must be written.
-    liveTimerWritesRetry: runSettleScenario({ text: 'Loading conversation...', stamp: Date.now() - (_SESSION_LOAD_IN_FLIGHT_MAX_MS + 1000), loadingSid: 'sid-a', sessionId: 'sid-other', settleSid: 'sid-a', expectedStamp: Date.now() - (_SESSION_LOAD_IN_FLIGHT_MAX_MS + 1000) }),
+    // One captured scalar feeds both the live stamp and the expected stamp so
+    // a clock tick between two Date.now() calls cannot flake the exact guard.
+    liveTimerWritesRetry: (() => {
+      const strandedStamp = Date.now() - (_SESSION_LOAD_IN_FLIGHT_MAX_MS + 1000);
+      return runSettleScenario({ text: 'Loading conversation...', stamp: strandedStamp, loadingSid: 'sid-a', sessionId: 'sid-other', settleSid: 'sid-a', expectedStamp: strandedStamp });
+    })(),
+    // Owning load still running (live latch for the same sid+generation):
+    // the messages fetch may still resolve — including a valid EMPTY
+    // transcript — so the timer must stand down, never write Retry. One
+    // captured scalar feeds the live stamp, the expected stamp, and the
+    // fresh-now clock so no tick can flake the exact guards.
+    owningLoadRunning: (() => {
+      const liveStamp = Date.now();
+      return runSettleScenario({ text: 'Loading conversation...', stamp: liveStamp, loadingSid: 'sid-a', sessionId: 'sid-a', settleSid: 'sid-a', expectedStamp: liveStamp, expectedGeneration: 7, generation: 7 });
+    })(),
+    // Superseded attempt (captured generation behind the live one): the
+    // predecessor must stand down even when the stamp still matches, so a
+    // same-session reload that inherited a stale DOM stamp is never settled
+    // by its own predecessor.
+    supersededGenerationStandsDown: runSettleScenario({ text: 'Loading conversation...', stamp: 5000, loadingSid: 'sid-a', sessionId: 'sid-a', settleSid: 'sid-a', expectedStamp: 5000, expectedGeneration: 7, generation: 8 }),
   },
 };
 
@@ -230,6 +291,7 @@ def _build_script() -> str:
         _NODE_SCRIPT.replace(
             "__SESSION_LOAD_IN_FLIGHT_MAX_MS_SRC__", SESSION_LOAD_IN_FLIGHT_MAX_MS_SRC
         )
+        .replace("__RETRY_ESCAPES_SRC__", RETRY_ESCAPES_SRC)
         .replace("__CONVERSATION_LOADING_AGE_MS_SRC__", CONVERSATION_LOADING_AGE_MS_SRC)
         .replace("__SESSION_LOAD_IN_FLIGHT_FOR_SRC__", SESSION_LOAD_IN_FLIGHT_FOR_SRC)
         .replace(
@@ -298,7 +360,13 @@ def test_settle_writes_retry_only_when_stranded():
             f"{label}: clicking Retry must call loadSession(sid, {{force: true}})"
         )
 
-    for label in ("freshInflight", "sameSession", "noLoadingText"):
+    for label in (
+        "freshInflight",
+        "sameSession",
+        "noLoadingText",
+        "owningLoadRunning",
+        "supersededGenerationStandsDown",
+    ):
         case = settle[label]
         assert case["wroteRetry"] is False, (
             f"{label}: the pane must be left untouched (no retry written)"
@@ -401,11 +469,20 @@ function installTimerEnv({ stamp, loadingSid, generation, sessionId, messages })
   globalThis.S = { session: sessionId === null ? null : { session_id: sessionId } };
   if (messages !== undefined) globalThis.S.messages = messages;
   globalThis.loadSession = (sid, opts) => { M2.loadCalls.push({ sid, opts }); };
+  // The settle helper renders through t() in production; default to the
+  // English fallback strings so assertions stay behavioral, not locale-bound.
+  globalThis.t = (key) =>
+    key === 'conversation_load_failed'
+      ? 'Couldn\u2019t load this conversation.'
+      : key === 'conversation_load_retry'
+        ? 'Retry'
+        : key;
   M2.loadCalls.length = 0;
   pendingTimers.length = 0;
 }
 
 __SESSION_LOAD_IN_FLIGHT_MAX_MS_SRC__
+__RETRY_ESCAPES_SRC__
 __CONVERSATION_LOADING_AGE_MS_SRC__
 __SESSION_LOAD_IN_FLIGHT_FOR_SRC__
 __SETTLE_STRANDED_CONVERSATION_LOADING_SRC__
@@ -419,12 +496,17 @@ function retryWritten() {
 const T0 = 1000000;
 const timerResults = {};
 
-// A: the arm path schedules the real callback at the expiry deadline.
+// A: the arm path schedules the real callback at the expiry deadline, and
+// reports the latch window the settle path enforces, so the test can prove
+// the two halves share one lifecycle without naming production constants.
 {
   installTimerEnv({ stamp: T0, loadingSid: 'sid-a', generation: 1, sessionId: 'sid-other', messages: [] });
   nowMs = T0;
   _armStrandedConversationLoadingTimer('sid-a', T0, 1);
   timerResults.armedDelay = pendingTimers.length ? pendingTimers[pendingTimers.length - 1].delay : null;
+  timerResults.latchWindowMs = (typeof _SESSION_LOAD_IN_FLIGHT_MAX_MS === 'number')
+    ? _SESSION_LOAD_IN_FLIGHT_MAX_MS
+    : null;
 }
 
 // B: no Retry at 4s; Retry appears at the expiry boundary via the real callback.
@@ -459,23 +541,53 @@ const timerResults = {};
   timerResults.newerSettlesAtOwnExpiry = retryWritten();
 }
 
-// D: metadata assigned (S.session matches) but the messages request never
-// resolves — the exact gap a bare session_id check misreads as completion.
+// D: owning attempt stranded past the latch window with Loading text still
+// on screen (messages fetch never resolved nor rendered): the expiry
+// callback must settle to Retry. The stamp is older than the latch window
+// while the latch still names the sid, so the live-latch guard has expired
+// and the pane is genuinely stranded.
 {
-  installTimerEnv({ stamp: T0, loadingSid: 'sid-a', generation: 1, sessionId: 'sid-a', messages: [] });
+  const strandedStamp = T0 - (_SESSION_LOAD_IN_FLIGHT_MAX_MS + 1000);
+  installTimerEnv({ stamp: strandedStamp, loadingSid: 'sid-a', generation: 1, sessionId: 'sid-a', messages: [] });
   nowMs = T0;
-  _armStrandedConversationLoadingTimer('sid-a', T0, 1);
-  advance(20000);
+  _settleStrandedConversationLoading('sid-a', strandedStamp, 1);
   timerResults.metaWithoutMessagesSettles = retryWritten();
 }
 
-// E: metadata assigned AND a renderable transcript arrived → stand down.
+// D2: owning load STILL running when its own timer fires. The arm-then-advance
+// shape cannot produce this (advancing to the deadline expires the latch by
+// construction), so drive the settle directly with a fresh live stamp: the
+// messages fetch may yet resolve — including a valid EMPTY transcript whose
+// empty-state render also runs before the latch clears — so the timer must
+// stand down, never converting the pending load into a Retry error.
 {
-  installTimerEnv({ stamp: T0, loadingSid: 'sid-a', generation: 1, sessionId: 'sid-a', messages: [{ role: 'user', content: 'hi' }] });
+  installTimerEnv({ stamp: T0, loadingSid: 'sid-a', generation: 1, sessionId: 'sid-a', messages: [] });
+  nowMs = T0;
+  _settleStrandedConversationLoading('sid-a', T0, 1);
+  timerResults.owningLoadRunningStandsDown = !retryWritten();
+}
+
+// E: render already replaced the placeholder (no Loading text): stand down
+// regardless of transcript shape.
+{
+  installTimerEnv({ stamp: T0, loadingSid: null, generation: 2, sessionId: 'sid-a', messages: [{ role: 'user', content: 'hi' }] });
+  timerInner._text = 'Already rendered transcript';
+  timerInner._html = '<div>transcript</div>';
   nowMs = T0;
   _armStrandedConversationLoadingTimer('sid-a', T0, 1);
   advance(20000);
   timerResults.metaWithTranscriptStandsDown = !retryWritten();
+}
+
+// E2: superseded predecessor (captured generation behind live) over a
+// matching stamp: stand down — the newer same-session attempt owns the pane
+// even though the DOM stamp was inherited, not re-stamped.
+{
+  installTimerEnv({ stamp: T0, loadingSid: 'sid-a', generation: 2, sessionId: 'sid-a', messages: [] });
+  nowMs = T0;
+  _armStrandedConversationLoadingTimer('sid-a', T0, 1);
+  advance(20000);
+  timerResults.supersededGenerationStandsDown = !retryWritten();
 }
 
 // F: same-session force reload (Retry click) that inherits the visible
@@ -502,8 +614,12 @@ const timerResults = {};
   timerResults.sameSessionForceReloadNewSettles = retryWritten();
 }
 
-// G: the production re-arm branch must NOT arm on rendered or Retry panes —
-// only a still-visible Loading placeholder re-arms (skip matrix).
+// G: the production re-arm branch refreshes the stamp on every same-session
+// force reload (attempt-scoped age authority) but arms a timer ONLY for a
+// still-visible Loading placeholder. Rendered panes refresh the stamp (so a
+// stale inherited timestamp can never read expired mid-fetch) and skip the
+// timer; Retry panes do the same (no live attempt to protect yet — the new
+// loadSession preamble that called the helper is the live attempt).
 {
   installTimerEnv({ stamp: T0, loadingSid: 'sid-a', generation: 1, sessionId: 'sid-a', messages: [{ role: 'user', content: 'hi' }] });
   timerInner._text = 'Already rendered transcript';
@@ -511,6 +627,7 @@ const timerResults = {};
   nowMs = T0 + 5000;
   globalThis._loadSessionGeneration = 2;
   const actedRendered = _restampStrandedPlaceholderForReload('sid-a', 2, true);
+  timerResults.restampRefreshesRenderedStamp = timerInner.dataset.conversationLoadingSince === String(T0 + 5000);
   timerResults.restampSkipsRendered = actedRendered === false && pendingTimers.length === 0;
 }
 {
@@ -520,6 +637,7 @@ const timerResults = {};
   nowMs = T0 + 5000;
   globalThis._loadSessionGeneration = 2;
   const actedRetry = _restampStrandedPlaceholderForReload('sid-a', 2, true);
+  timerResults.restampRefreshesRetryStamp = timerInner.dataset.conversationLoadingSince === String(T0 + 5000);
   timerResults.restampSkipsRetry = actedRetry === false && pendingTimers.length === 0;
 }
 {
@@ -542,6 +660,7 @@ def _build_timer_script() -> str:
         _NODE_TIMER_SCRIPT.replace(
             "__SESSION_LOAD_IN_FLIGHT_MAX_MS_SRC__", SESSION_LOAD_IN_FLIGHT_MAX_MS_SRC
         )
+        .replace("__RETRY_ESCAPES_SRC__", RETRY_ESCAPES_SRC)
         .replace("__CONVERSATION_LOADING_AGE_MS_SRC__", CONVERSATION_LOADING_AGE_MS_SRC)
         .replace("__SESSION_LOAD_IN_FLIGHT_FOR_SRC__", SESSION_LOAD_IN_FLIGHT_FOR_SRC)
         .replace(
@@ -559,17 +678,18 @@ def _build_timer_script() -> str:
 def test_expiry_timer_armed_at_deadline():
     """The arm path must schedule the real callback at the expiry deadline.
 
-    The delay half is observable behavior (the fake clock records the real
-    scheduled delay); the constant half pins the reviewed flaw where a 4s
-    callback raced the 20s latch and could never settle.
+    Purely behavioral: the fake clock records the delay the REAL extracted
+    armer schedules, and the boundary pair (silent at 4s, Retry at 20s)
+    proves the callback cannot race the live latch — the reviewed flaw where
+    a 4s callback fired while the 20s latch still owned the pane. The
+    armed delay must equal the latch window the settle path reads, so the
+    two halves cannot drift apart.
     """
-    assert "_SESSION_LOAD_IN_FLIGHT_MAX_MS" in ARM_STRANDED_TIMER_SRC, (
-        "the arm helper must schedule at the expiry deadline"
-    )
-    assert "4000" not in ARM_STRANDED_TIMER_SRC, (
-        "the arm helper must not use a separate early callback"
-    )
     body = _run_node(_build_timer_script())
+    assert body["armedDelay"] == body["latchWindowMs"], (
+        "the scheduled callback must fire exactly at the latch-expiry "
+        "boundary the settle path enforces"
+    )
     assert body["armedDelay"] == 20000, (
         "the real scheduled callback must fire at the 20s expiry deadline"
     )
@@ -599,24 +719,35 @@ def test_stale_scheduled_callback_leaves_newer_placeholder():
 
 
 @pytest.mark.skipif(NODE is None, reason="node not on PATH")
-def test_metadata_without_messages_still_settles():
-    """S.session assigned but messages never resolve → still Retry.
+def test_abandoned_attempt_settles_while_running_attempt_stands_down():
+    """Only an attempt that ended without rendering settles to Retry.
 
-    A bare S.session.session_id check misreads this gap as completion;
-    placeholder text plus ownership stamp plus no transcript must settle.
+    The latch is attempt ownership: a cleared latch means the owning attempt
+    ended without rendering (settle), while a live latch for the same
+    sid+generation means the messages fetch may still resolve — including a
+    valid EMPTY transcript, whose empty-state render also runs before the
+    latch clears — so the timer must stand down, never manufacturing Retry.
     """
     body = _run_node(_build_timer_script())
     assert body["metaWithoutMessagesSettles"] is True, (
-        "metadata without a renderable transcript must still settle to Retry"
+        "an attempt that ended without rendering must still settle to Retry"
+    )
+    assert body["owningLoadRunningStandsDown"] is True, (
+        "a still-running owning load must stand the timer down (its empty "
+        "transcript is valid, not a failure)"
     )
 
 
 @pytest.mark.skipif(NODE is None, reason="node not on PATH")
-def test_metadata_with_transcript_stands_down():
-    """S.session assigned AND a renderable transcript arrived → no Retry."""
+def test_rendered_pane_and_superseded_generation_stand_down():
+    """A replaced placeholder or a superseded generation never settles."""
     body = _run_node(_build_timer_script())
     assert body["metaWithTranscriptStandsDown"] is True, (
-        "an arrived transcript must stand the settle down"
+        "a replaced (rendered) placeholder must stand the settle down"
+    )
+    assert body["supersededGenerationStandsDown"] is True, (
+        "a superseded predecessor must stand down even when the stamp "
+        "still matches (same-session reload inherited the DOM stamp)"
     )
 
 
@@ -650,10 +781,22 @@ def test_same_session_force_reload_rearms_through_production_branch():
 
 @pytest.mark.skipif(NODE is None, reason="node not on PATH")
 def test_production_rearm_skips_rendered_retry_and_non_force_panes():
-    """The production re-arm branch arms a timer only for a Loading pane."""
+    """The production re-arm branch arms a timer only for a Loading pane.
+
+    Every same-session force reload refreshes the stamp (attempt-scoped age
+    authority, so a stale inherited timestamp can never read expired
+    mid-fetch); only a visible Loading placeholder additionally arms the
+    expiry timer.
+    """
     body = _run_node(_build_timer_script())
+    assert body["restampRefreshesRenderedStamp"] is True, (
+        "a reload over a rendered pane must refresh the stamp"
+    )
     assert body["restampSkipsRendered"] is True, (
         "a rendered transcript must never re-arm a settlement timer"
+    )
+    assert body["restampRefreshesRetryStamp"] is True, (
+        "a reload over a Retry pane must refresh the stamp"
     )
     assert body["restampSkipsRetry"] is True, (
         "an already-settled Retry pane must never re-arm a settlement timer"
