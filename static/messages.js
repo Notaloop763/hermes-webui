@@ -2450,6 +2450,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     _cancelThrottledSnapshotTimer();
     _terminalStateReached=true;
     _streamFinalized=true;
+    _settleAnchorScenePaint();
     _cancelAnimationFramePendingStreamRender();
     _streamFadeCleanupReduceMotionListener();
     _smdEndParser();
@@ -2923,8 +2924,28 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   let _anchorSceneRafHandle=null;
   let _anchorSceneLastPaintMs=0;
   let _anchorScenePendingReasoning=null;
+  // Terminal/DOM-settled guard, distinct from _streamFinalized. _streamFinalized
+  // flips as soon as the terminal SSE event arrives so late token/reasoning
+  // events cannot schedule prose work, but the live scene must keep painting
+  // through the `done` fade drain (each drain step projects new prose via
+  // _upsertAnchorProcessProse). _anchorSceneSettled flips only immediately
+  // before the settled DOM replacement, so drain paints stay live while
+  // post-settlement paints are impossible.
+  let _anchorSceneSettled=false;
   function _anchorScenePaintIntervalMs(){
     return _shouldUseLiveProseFade()?33:66;
+  }
+  function _isAnchorScenePaintLive(){
+    if(_anchorSceneSettled) return false;
+    if(!_isActiveSession()) return false;
+    try{
+      if(typeof S!=='undefined'&&S&&S.activeStreamId!==streamId) return false;
+    }catch(_){ return false; }
+    return true;
+  }
+  function _settleAnchorScenePaint(){
+    _anchorSceneSettled=true;
+    _cancelPendingAnchorScenePaint();
   }
   function _cancelPendingAnchorScenePaint(){
     _anchorScenePendingReasoning=null;
@@ -2976,19 +2997,27 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     }catch(_){}
   }
   function _scheduleAnchorSceneRender(){
+    if(!_isAnchorScenePaintLive()) return false;
     if(_anchorSceneTimeoutHandle!==null||_anchorSceneRafHandle!==null) return true;
     const fire=()=>{
       _anchorSceneRafHandle=null;
-      // A queued paint can outlive finalization or a session switch; writing a
-      // live scene into a settled/detached turn is the #631 Bug A class, so
-      // re-check ownership here instead of trusting the schedule.
-      if(_streamFinalized||!_isActiveSession()) return;
+      // A queued paint can outlive settlement or a session/stream switch;
+      // writing a live scene into a settled/detached turn is the #631 Bug A
+      // class, so re-check liveness here instead of trusting the schedule.
+      // _streamFinalized alone cannot gate this: it flips before the `done`
+      // fade drain, and blocking on it freezes the newest prose in the visible
+      // scene until the settled replacement.
+      if(!_isAnchorScenePaintLive()) return;
       if(_paintAnchorLiveScene()) _anchorScenePendingReasoning=null;
       else _flushPendingAnchorReasoningRowUpdate();
     };
     const waitMs=_anchorScenePaintIntervalMs()-(performance.now()-_anchorSceneLastPaintMs);
     if(waitMs>0){
       _anchorSceneTimeoutHandle=setTimeout(()=>{
+        // The timeout→rAF handoff must not publish an rAF for a scene that
+        // settled or moved streams while the timeout was pending. Clear the
+        // timeout slot so teardown observes zero pending handles.
+        if(!_isAnchorScenePaintLive()){ _anchorSceneTimeoutHandle=null; return; }
         _anchorSceneTimeoutHandle=null;
         _anchorSceneRafHandle=requestAnimationFrame(fire);
       },waitMs);
@@ -3006,6 +3035,12 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   function _renderAnchorLiveScene(pendingReasoning){
     if(!_anchorRegistry||!_isActiveSession()) return false;
     if(typeof window==='undefined'||typeof window._renderLiveAnchorActivitySceneForStream!=='function') return false;
+    // Post-settlement (or stream-replaced) paints must not schedule: every
+    // terminal path settles before replacing the DOM, so a paint scheduled
+    // here would outlive the live turn and violate the released-on-exit
+    // contract. The `done` fade drain stays live because it runs before
+    // _settleAnchorScenePaint().
+    if(!_isAnchorScenePaintLive()) return false;
     // Only coalesce once the anchor scene already owns the live turn: the first
     // paint of a stream stays synchronous so ownership — and the caller's
     // fallback decision — comes from a real render. hide_all_activity never
@@ -6233,7 +6268,10 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         // Bug A fix: cancel any pending rAF and mark stream finalized before
         // the DOM is settled by renderMessages, so no trailing token/reasoning rAF
         // can reintroduce a stale thinking card or duplicate content.
+        // Settle the coalesced scene paint here (not on `done` arrival) so the
+        // fade drain above keeps painting the newest prose into the visible row.
         _streamFinalized=true;
+        _settleAnchorScenePaint();
         _cancelAnimationFramePendingStreamRender();
         _streamFadeCleanupReduceMotionListener();
         if(typeof finalizeThinkingCard==='function') finalizeThinkingCard();
@@ -6680,6 +6718,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       _cancelThrottledSnapshotTimer();
       _clearAnchorProseIncrementalNode();
       _streamFinalized=true;
+      _settleAnchorScenePaint();
       _cancelAnimationFramePendingStreamRender();
       _streamFadeCleanupReduceMotionListener();
       _smdEndParser();
@@ -6942,6 +6981,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       _cancelThrottledSnapshotTimer();
       _clearAnchorProseIncrementalNode();
       _streamFinalized=true;
+      _settleAnchorScenePaint();
       _cancelAnimationFramePendingStreamRender();
       _streamFadeCleanupReduceMotionListener();
       _smdEndParser();
@@ -7107,6 +7147,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       _cancelThrottledSnapshotTimer();
       _clearAnchorProseIncrementalNode();
       _streamFinalized=true;
+      _settleAnchorScenePaint();
       _cancelAnimationFramePendingStreamRender();
       _streamFadeCleanupReduceMotionListener();
       _smdEndParser();
@@ -7206,6 +7247,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     _cancelThrottledSnapshotTimer();
     _clearAnchorProseIncrementalNode();
     _streamFinalized=true;
+    _settleAnchorScenePaint();
     _cancelAnimationFramePendingStreamRender();
     _streamFadeCleanupReduceMotionListener();
     if(typeof finalizeThinkingCard==='function') finalizeThinkingCard();
