@@ -327,7 +327,12 @@ def test_learn_i18n_keys_resolve_in_en_locale():
 #
 # Greptile P2: a /learn turn queued while busy must keep its payload/display
 # separation — the queued-message state must preserve the display override and
-# the drain must pass it back into send(). Full send()/setBusy() cannot load
+# the drain must pass it back into send(). Sibling paths in the same class:
+# the /api/chat/start active-stream conflict retry (REAL _conflictRetryQueueEntry
+# from static/messages.js) and the queue-chip surfaces (REAL
+# _queuedEntryDisplayText + _applyQueuedEntryEdit from static/ui.js: chips show
+# the invocation, and an in-place chip edit drops the stale override so the
+# edited turn drains as user-authored plain text). Full send()/setBusy() cannot load
 # in node vm (DOM-heavy files), so these tests execute the REAL extracted
 # functions (_withDisplayOverride from static/messages.js, queueSessionMessage
 # + shiftQueuedSessionMessage from static/ui.js) with stubbed storage, and run
@@ -363,8 +368,11 @@ def _run_queue_harness(test_js):
         "function _persistSessionQueueStorage(sid, q){ __persisted[sid] = JSON.stringify(q); }\n"
         "function _clearPersistedSessionQueue(sid){ delete __persisted[sid]; }\n"
         + _extract_js_function(MESSAGES_JS, "_withDisplayOverride") + "\n"
+        + _extract_js_function(MESSAGES_JS, "_conflictRetryQueueEntry") + "\n"
         + _extract_js_function(UI_JS, "queueSessionMessage") + "\n"
         + _extract_js_function(UI_JS, "shiftQueuedSessionMessage") + "\n"
+        + _extract_js_function(UI_JS, "_queuedEntryDisplayText") + "\n"
+        + _extract_js_function(UI_JS, "_applyQueuedEntryEdit") + "\n"
     )
     harness = (
         "const vm = require('vm');\n"
@@ -425,6 +433,97 @@ def test_queue_state_preserves_display_override():
     assert result["drained"]["text"] == "[/learn] generated prompt"
     assert result["drained"]["displayText"] == "/learn my request"
     assert result["queueGone"] and result["persistedCleared"]
+
+
+def test_conflict_retry_entry_keeps_display_override():
+    """The REAL conflict-retry constructor preserves the payload/display split.
+
+    Covers static/messages.js send()'s /api/chat/start active-stream catch:
+    the retried turn must queue with the same one-shot override as the
+    busy-queue branches, so the drained turn shows the /learn invocation
+    instead of the generated prompt. Blank/missing override yields the exact
+    pre-fix payload shape. Fails pre-fix (helper absent → extraction raises)."""
+    result = _run_queue_harness(
+        "const model = {model: 'm', model_provider: 'p'};"
+        " const entry = _conflictRetryQueueEntry('[/learn] generated prompt',"
+        "  model, 'default', '/learn my request');"
+        " const plain = _conflictRetryQueueEntry('hello', model, 'default');"
+        " const blank = _conflictRetryQueueEntry('[/learn] generated prompt',"
+        "  model, 'default', '   ');"
+        " queueSessionMessage('sid-1', entry);"
+        " const persisted = JSON.parse(__persisted['sid-1']);"
+        " const next = shiftQueuedSessionMessage('sid-1');"
+        " return {entry, plain, blank,"
+        "  persistedEntry: persisted[0], drained: next};"
+    )
+    assert result["entry"] == {
+        "text": "[/learn] generated prompt", "files": [],
+        "model": "m", "model_provider": "p", "profile": "default",
+        "displayText": "/learn my request",
+    }
+    assert result["plain"] == {
+        "text": "hello", "files": [],
+        "model": "m", "model_provider": "p", "profile": "default",
+    }, "a missing override must yield the exact pre-fix payload shape"
+    assert "displayText" not in result["blank"], (
+        "a blank override must not be stored on the queued entry"
+    )
+    assert result["persistedEntry"]["displayText"] == "/learn my request", (
+        "the retried override must survive the JSON persist round-trip"
+    )
+    assert result["drained"]["text"] == "[/learn] generated prompt"
+    assert result["drained"]["displayText"] == "/learn my request"
+
+
+def test_queued_entry_display_text_prefers_override():
+    """The REAL chip-label helper shows the invocation, not the prompt.
+
+    Covers static/ui.js _renderQueueChips: a queued /learn turn must chip as
+    its /learn invocation (what the drain will render), while plain and
+    legacy-shaped entries chip as their payload. Fails pre-fix (absent)."""
+    result = _run_queue_harness(
+        "return {"
+        " learn: _queuedEntryDisplayText({text: '[/learn] generated prompt',"
+        "  displayText: '/learn my request'}),"
+        " plain: _queuedEntryDisplayText({text: 'hello'}),"
+        " blank: _queuedEntryDisplayText({text: '[/learn] generated prompt',"
+        "  displayText: '  '}),"
+        " legacy: _queuedEntryDisplayText({message: 'old shape'}),"
+        " empty: _queuedEntryDisplayText(null)};"
+    )
+    assert result == {
+        "learn": "/learn my request",
+        "plain": "hello",
+        "blank": "[/learn] generated prompt",
+        "legacy": "old shape",
+        "empty": "",
+    }
+
+
+def test_apply_queued_entry_edit_drops_stale_override():
+    """An in-place chip edit re-targets the payload and drops the override.
+
+    Covers the static/ui.js chip onblur save through the REAL helper: the
+    edited turn is user-authored, so display==payload like any plain queued
+    message and the drain cannot show a stale invocation for edited content.
+    Fails pre-fix (absent)."""
+    result = _run_queue_harness(
+        "const edited = _applyQueuedEntryEdit("
+        " {text: '[/learn] generated prompt', displayText: '/learn my request',"
+        "  files: [], model: 'm', model_provider: 'p', profile: 'd',"
+        "  _queued_at: 1}, 'user-edited text');"
+        " const plain = _applyQueuedEntryEdit({text: 'a', model: 'm'}, 'b');"
+        " return {edited, plain,"
+        "  nullEntry: _applyQueuedEntryEdit(null, 'x')};"
+    )
+    assert result["edited"]["text"] == "user-edited text"
+    assert "displayText" not in result["edited"], (
+        "a stale invocation must not survive an edit of the queued payload"
+    )
+    assert result["edited"]["model"] == "m"
+    assert result["edited"]["_queued_at"] == 1
+    assert result["plain"] == {"text": "b", "model": "m"}
+    assert result["nullEntry"] is None
 
 
 def _run_learn_queue_harness(api_js, test_js):
