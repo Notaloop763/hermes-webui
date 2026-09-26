@@ -340,12 +340,12 @@ python3 -c "import hermes_constants; print(hasattr(hermes_constants, 'pin_proces
 
 ```bash
 # runtime_scope: "profile" (bound), "legacy_process" (Agent without a routed-profile
-# predicate), "unavailable" (scope could not be confirmed right now)
+# predicate but a bound home), "unavailable" (scope could not be confirmed; roots withheld)
 curl -s -b "hermes_profile=<profile>" http://127.0.0.1:8787/api/skills | python3 -m json.tool | grep -E '"(name|runtime_scope)"'
 python3 -c "import agent.secret_scope as s, hermes_constants as h; print(hasattr(s, 'serves_routed_profile'), hasattr(h, 'hermes_home_key'))"
 ```
 
-**Fix.** `unavailable` while a turn is running is expected: refresh once the turn finishes. If it persists with no turn running, the Agent predates routed-profile scoping; upgrade Hermes Agent. `legacy_process` means the Agent has no routed-profile predicate at all, so the process-wide lookup is kept. Confirm the external path is listed under `skills.external_dirs` in that profile's `config.yaml` and exists on disk.
+**Fix.** `unavailable` while a turn is running is expected: refresh once the turn finishes. If it persists with no turn running, the Agent predates profile scoping (it cannot bind the request profile's home), so the WebUI withholds the external roots rather than leak another profile's; upgrade Hermes Agent. `legacy_process` means the Agent has no routed-profile predicate but the request profile's home is bound, so the lookup reads that profile. Confirm the external path is listed under `skills.external_dirs` in that profile's `config.yaml` and exists on disk.
 
 **When to file a bug.** File a WebUI bug if `runtime_scope` is `"profile"` and `/api/skills` still lists a path that belongs to another profile's `config.yaml`.
 

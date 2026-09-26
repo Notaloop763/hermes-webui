@@ -559,9 +559,10 @@ streaming turn's mirrored `HERMES_HOME` (the same mirror described in §4.10).
   only then; otherwise they are withheld (fail closed) so an unconfirmed scope can never
   contribute another profile's directories.
 - `/api/skills` reports `runtime_scope`: `profile` (bound to the request profile),
-  `legacy_process` (the Agent has no routed-profile predicate, so the process-wide
-  lookup is kept), or `unavailable` (scope could not be confirmed right now; external
-  roots withheld). The dirs-only `_active_skill_search_dirs()` used by skill content,
+  `legacy_process` (the Agent has no routed-profile predicate but the request profile's
+  home override is bound, so the lookup reads that profile), or `unavailable` (scope
+  could not be confirmed, including a legacy Agent that cannot bind a home override;
+  external roots withheld). The dirs-only `_active_skill_search_dirs()` used by skill content,
   linked-file and toggle lookups inherits the same fail-closed directory set.
 
 ---
