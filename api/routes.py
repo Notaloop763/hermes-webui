@@ -929,16 +929,10 @@ def _skills_list_from_dir(skills_dir: Path, category: str | None = None) -> dict
         skill_matches_platform,
     )
 
+    created_local_dir = False
     if not skills_dir.exists():
         skills_dir.mkdir(parents=True, exist_ok=True)
-        _dirs, runtime_scope = _active_skill_search_dirs_scoped(skills_dir)
-        return {
-            "success": True,
-            "skills": [],
-            "categories": [],
-            "runtime_scope": runtime_scope,
-            "message": f"No skills found. Skills directory created at {skills_dir}/",
-        }
+        created_local_dir = True
 
     all_skills = []
     seen_names: set[str] = set()
@@ -998,6 +992,8 @@ def _skills_list_from_dir(skills_dir: Path, category: str | None = None) -> dict
     }
     if all_skills:
         result["hint"] = "Use skill_view(name) to see full content, tags, and linked files"
+    elif created_local_dir:
+        result["message"] = f"No skills found. Skills directory created at {skills_dir}/"
     else:
         result["message"] = "No skills found in skills/ directory."
     return result

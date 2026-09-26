@@ -1581,7 +1581,7 @@ function duplicateCurrentCron(){
     isEdit: false,
   });
   if (!_cronSkillsCache) {
-    api('/api/skills').then(d=>{_cronSkillsCache=d.skills||[]; _bindCronSkillPicker();}).catch(()=>{});
+    api('/api/skills').then(d=>{if(d.runtime_scope!=='unavailable')_cronSkillsCache=d.skills||[]; _bindCronSkillPicker();}).catch(()=>{});
   } else {
     _bindCronSkillPicker();
   }
@@ -1615,7 +1615,7 @@ function openCronCreate(){
   _cronSelectedSkills = [];
   _renderCronForm({ name:'', schedule:'0 9 * * *', prompt:'', deliver:'local', profile:'', toast_notifications:true, model:'', provider:'', isEdit:false });
   _cronSkillsCache = null;
-  api('/api/skills').then(d=>{_cronSkillsCache=d.skills||[]; _bindCronSkillPicker();}).catch(()=>{});
+  api('/api/skills').then(d=>{if(d.runtime_scope!=='unavailable')_cronSkillsCache=d.skills||[]; _bindCronSkillPicker();}).catch(()=>{});
   loadCronProfiles().then(()=>_refreshCronProfileSelect('')).catch(()=>{});
   // Mobile: the cron form lives in the main view, which is covered by the
   // full-screen sidebar drawer. Close the drawer so the form is visible (mirror
@@ -1644,7 +1644,7 @@ function openCronEdit(job){
     isEdit: true,
   });
   if (!_cronSkillsCache) {
-    api('/api/skills').then(d=>{_cronSkillsCache=d.skills||[]; _bindCronSkillPicker();}).catch(()=>{});
+    api('/api/skills').then(d=>{if(d.runtime_scope!=='unavailable')_cronSkillsCache=d.skills||[]; _bindCronSkillPicker();}).catch(()=>{});
   } else {
     _bindCronSkillPicker();
   }
@@ -4915,12 +4915,17 @@ async function loadSkills() {
   const box = $('skillsList');
   try {
     const data = await api('/api/skills');
-    _skillsData = data.skills || [];
+    const skills = data.skills || [];
+    // A runtime_scope of "unavailable" withholds this profile's external roots
+    // (e.g. a chat turn on the profile is running). Don't cache that incomplete
+    // list, or reopening the panel keeps hiding the external skills until an
+    // unrelated cache reset (save/delete/profile switch) clears it.
+    if (data.runtime_scope !== 'unavailable') _skillsData = skills;
     // Prune collapsed state to only keep categories present in fresh data,
     // avoiding stale keys when categories are renamed or removed server-side.
-    const liveCats = new Set(_skillsData.map(s => s.category || '(general)'));
+    const liveCats = new Set(skills.map(s => s.category || '(general)'));
     for (const c of _collapsedCats) { if (!liveCats.has(c)) _collapsedCats.delete(c); }
-    renderSkills(_skillsData);
+    renderSkills(skills);
   } catch(e) { box.innerHTML = `<div style="padding:12px;color:var(--accent);font-size:12px">Error: ${esc(e.message)}</div>`; }
 }
 
