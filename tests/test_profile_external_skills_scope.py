@@ -17,11 +17,13 @@ from pathlib import Path
 class FakeAgent:
     """Minimal model of the hermes-agent surface used for external skill roots."""
 
-    def __init__(self, *, routed=None, expose_routing=True, process_home=None):
+    def __init__(self, *, routed=None, expose_routing=True, process_home=None,
+                 expose_home_override=True):
         self.override = None
         self.process_home = process_home
         self._routed = routed
         self._expose_routing = expose_routing
+        self._expose_home_override = expose_home_override
         self.external_by_home = {}
 
     def home(self):
@@ -52,11 +54,12 @@ class FakeAgent:
         def reset_hermes_home_override(token):
             agent.override = token
 
-        hc.set_hermes_home_override = set_hermes_home_override
-        hc.reset_hermes_home_override = reset_hermes_home_override
-        hc.hermes_home_key = lambda path=None: agent.key(
-            path if path is not None else agent.home()
-        )
+        if agent._expose_home_override:
+            hc.set_hermes_home_override = set_hermes_home_override
+            hc.reset_hermes_home_override = reset_hermes_home_override
+            hc.hermes_home_key = lambda path=None: agent.key(
+                path if path is not None else agent.home()
+            )
 
         agent_pkg = types.ModuleType("agent")
         agent_pkg.__path__ = []
@@ -88,9 +91,13 @@ def _install_fake_agent(
     process_home,
     routed=None,
     expose_routing=True,
+    expose_home_override=True,
 ):
     agent = FakeAgent(
-        routed=routed, expose_routing=expose_routing, process_home=process_home
+        routed=routed,
+        expose_routing=expose_routing,
+        process_home=process_home,
+        expose_home_override=expose_home_override,
     )
     agent.external_by_home = {str(k): v for k, v in external_dirs_by_home.items()}
     for name, module in agent.build_modules().items():
@@ -208,3 +215,34 @@ def test_agent_without_routed_predicate_reports_legacy_scope(monkeypatch, tmp_pa
 
     assert shared_skills in dirs
     assert scope == "legacy_process"
+
+
+def test_legacy_agent_without_home_override_withholds_external_roots(monkeypatch, tmp_path):
+    """Fail closed when a legacy Agent cannot bind the request profile's home.
+
+    Without the context-local home override the Agent helper reads the process-wide
+    ``HERMES_HOME`` (which a streaming turn may have mirrored to another profile), so
+    trusting it could expose another profile's external roots.
+    """
+    from api import profiles, routes
+
+    default_home = tmp_path / "default"
+    active_home = tmp_path / "profiles" / "translation"
+    shared_skills = tmp_path / "shared-skills"
+    (active_home / "skills").mkdir(parents=True)
+    shared_skills.mkdir()
+
+    monkeypatch.setenv("HERMES_HOME", str(default_home))
+    _patch_profile(monkeypatch, profiles, "translation", active_home, default_home)
+    _install_fake_agent(
+        monkeypatch,
+        external_dirs_by_home={active_home: [shared_skills]},
+        process_home=default_home,
+        expose_routing=False,
+        expose_home_override=False,
+    )
+
+    dirs, scope = routes._active_skill_search_dirs_scoped(active_home / "skills")
+
+    assert shared_skills not in dirs
+    assert scope == "unavailable"

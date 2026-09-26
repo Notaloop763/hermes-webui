@@ -53,7 +53,13 @@ def _routing_view(profile_home: Path, override_bound: bool) -> SkillRuntimeScope
         from agent.secret_scope import serves_routed_profile
         from hermes_constants import hermes_home_key
     except ImportError:
-        # No routed-profile predicate: the Agent predates profile scoping.
+        # Agent predates profile scoping. A bound context-local home override is the
+        # only proof that the Agent helper will read this request's profile; without
+        # it the lookup falls back to the process-wide HERMES_HOME (which a streaming
+        # turn may have mirrored to another profile), so fail closed rather than
+        # expose another profile's external roots.
+        if not override_bound:
+            return SkillRuntimeScope(profile_home, trusted=False, legacy=False)
         return SkillRuntimeScope(profile_home, trusted=True, legacy=True)
     from api.profiles import get_process_profile_home
 

@@ -152,3 +152,28 @@ def test_skills_api_default_profile_reads_external_dirs_from_process_home(monkey
         "default-local",
         "shared-library",
     }
+
+
+def test_skills_api_lists_external_dirs_without_local_skills_dir(monkeypatch, tmp_path):
+    """A profile whose local skills/ dir does not exist yet still lists external roots."""
+    from api import profiles, routes
+
+    default_home = tmp_path / "default"
+    active_home = tmp_path / "profiles" / "translation"
+    shared_skills = tmp_path / "shared-skills"
+    _write_skill(shared_skills, "shared-library")
+    _write_config(default_home, [])
+    _write_config(active_home, [str(shared_skills)])
+    assert not (active_home / "skills").exists()
+
+    monkeypatch.setenv("HERMES_HOME", str(default_home))
+    _patch_active_profile(monkeypatch, profiles, "translation", active_home, default_home)
+    _patch_agent_routing(monkeypatch, routed=True)
+
+    captured = _capture_json(monkeypatch, routes)
+    handled = routes.handle_get(MagicMock(), urlparse("/api/skills"))
+
+    assert handled is True
+    assert captured["status"] == 200
+    assert {item["name"] for item in captured["payload"]["skills"]} == {"shared-library"}
+    assert (active_home / "skills").is_dir()
