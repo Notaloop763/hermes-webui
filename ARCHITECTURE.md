@@ -722,6 +722,28 @@ file populated before `get_available_models` returns, and the single-flight rele
 with the queued commit, so ownership still spans the durable write. The out-of-band worker
 commits directly, which is correct because it holds no catalog lock by then.
 
+### 4.12 External Skill-Directory Profile Boundary
+
+The WebUI resolves a profile's local skills root itself, but `skills.external_dirs` is
+read by `agent.skill_utils.get_external_skills_dirs()`, which resolves the configured
+paths through the Hermes home: the context-local home override when the Agent provides
+one, else `os.environ['HERMES_HOME']`. Without a scope, a named profile could list
+another profile's external roots, and — mid-turn — the root profile could follow a
+streaming turn's mirrored `HERMES_HOME` (the same mirror described in §4.10).
+
+- `_active_skill_search_dirs_scoped()` in `api/routes.py` runs the Agent lookup inside
+  `api.skill_runtime.skill_runtime_scope()`, which binds the request profile's home
+  (root profile included) via `api.profiles.profile_env_for_active_request_readonly()`
+  without touching `os.environ`, and restores it on exit.
+- The scope is trusted only when the Agent's routed-profile decision matches the
+  profile WebUI resolved (`api.skill_runtime._routing_view()`). External roots are used
+  only then; otherwise they are withheld (fail closed) so an unconfirmed scope can never
+  contribute another profile's directories.
+- `/api/skills` reports `runtime_scope`: `profile` (bound to the request profile),
+  `legacy_process` (the Agent has no routed-profile predicate, so the process-wide
+  lookup is kept), or `unavailable` (scope could not be confirmed right now; external
+  roots withheld). The dirs-only `_active_skill_search_dirs()` used by skill content,
+  linked-file and toggle lookups inherits the same fail-closed directory set.
 
 ---
 
