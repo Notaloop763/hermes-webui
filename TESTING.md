@@ -359,6 +359,20 @@ EXPECT:
   - Switching away and back to the conversation restores the same model in the footer selector
 FAIL: Dropdown shows the wrong active model after a session switch, or sending uses a stale model.
 
+### T3.2a: Reasoning Effort Reflects Active Conversation
+SETUP: Two sessions using the same reasoning-capable model.
+STEPS:
+  1. In session A, select Low reasoning effort.
+  2. In session B, select High reasoning effort.
+  3. Switch A → B → A using the sidebar.
+  4. Repeat at desktop width and at a narrow/mobile width using the mobile composer configuration action.
+  5. Reload the page on each session and send a turn.
+EXPECT:
+  - The reasoning chip/action reads Low in session A and High in session B after every switch and reload.
+  - The next turn in each session uses that session's restored effort.
+  - The model chip remains unchanged when both sessions use the same model.
+FAIL: The reasoning control keeps the previously viewed session's value, resets after reload, or the next turn uses a stale effort.
+
 ### T3.3: Context Badge Shares Footer Space Cleanly
 SETUP: Active session with at least one completed response.
 STEPS:
