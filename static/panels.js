@@ -19,7 +19,8 @@ let _kanbanSuppressCardClickUntil = 0;
 // EventSource fails to connect (proxy that strips text/event-stream, etc).
 let _kanbanEventSource = null;
 let _kanbanEventSourceFailures = 0;
-let _skillsData = null; // cached skills list
+let _skillsData = null; // current skills list; may be incomplete while runtime scope is unavailable
+let _skillsDataIncomplete = false;
 let _cronList = null; // cached cron jobs (array)
 let _currentCronDetail = null; // full cron job object
 let _currentCronDetailKey = '';
@@ -1580,11 +1581,7 @@ function duplicateCurrentCron(){
     provider: job.provider || '',
     isEdit: false,
   });
-  if (!_cronSkillsCache) {
-    api('/api/skills').then(d=>{if(d.runtime_scope!=='unavailable')_cronSkillsCache=d.skills||[]; _bindCronSkillPicker();}).catch(()=>{});
-  } else {
-    _bindCronSkillPicker();
-  }
+  _loadCronSkills();
 }
 async function deleteCurrentCron(){
   if (!_currentCronDetail) return;
@@ -1602,8 +1599,21 @@ async function deleteCurrentCron(){
 let _cronSelectedSkills=[];
 let _cronIsDuplicate = false;
 let _cronSkillsCache=null;
+let _cronSkillsCacheIncomplete=false;
 let _cronProfilesCache=null;
 let _cronDeliveryOptionsCache=null;
+
+function _loadCronSkills(force=false){
+  // Keep an incomplete result usable for this form, but retry it whenever a
+  // later form opens. Only a confirmed result is a reusable cache entry.
+  if(_cronSkillsCache&&!force)_bindCronSkillPicker();
+  if(!force&&_cronSkillsCache&&!_cronSkillsCacheIncomplete)return;
+  api('/api/skills').then(d=>{
+    _cronSkillsCache=d.skills||[];
+    _cronSkillsCacheIncomplete=d.runtime_scope==='unavailable';
+    _bindCronSkillPicker();
+  }).catch(()=>{});
+}
 
 function openCronCreate(){
   if (typeof switchPanel === 'function' && _currentPanel !== 'tasks') switchPanel('tasks');
@@ -1615,7 +1625,8 @@ function openCronCreate(){
   _cronSelectedSkills = [];
   _renderCronForm({ name:'', schedule:'0 9 * * *', prompt:'', deliver:'local', profile:'', toast_notifications:true, model:'', provider:'', isEdit:false });
   _cronSkillsCache = null;
-  api('/api/skills').then(d=>{if(d.runtime_scope!=='unavailable')_cronSkillsCache=d.skills||[]; _bindCronSkillPicker();}).catch(()=>{});
+  _cronSkillsCacheIncomplete = false;
+  _loadCronSkills(true);
   loadCronProfiles().then(()=>_refreshCronProfileSelect('')).catch(()=>{});
   // Mobile: the cron form lives in the main view, which is covered by the
   // full-screen sidebar drawer. Close the drawer so the form is visible (mirror
@@ -1643,11 +1654,7 @@ function openCronEdit(job){
     provider: job.provider || '',
     isEdit: true,
   });
-  if (!_cronSkillsCache) {
-    api('/api/skills').then(d=>{if(d.runtime_scope!=='unavailable')_cronSkillsCache=d.skills||[]; _bindCronSkillPicker();}).catch(()=>{});
-  } else {
-    _bindCronSkillPicker();
-  }
+  _loadCronSkills();
   loadCronProfiles().then(()=>_refreshCronProfileSelect(job.profile || '')).catch(()=>{});
 }
 
@@ -4911,16 +4918,16 @@ async function clearConversation() {
 
 // ── Skills panel ──
 async function loadSkills() {
-  if (_skillsData) { renderSkills(_skillsData); return; }
+  if (_skillsData && !_skillsDataIncomplete) { renderSkills(_skillsData); return; }
   const box = $('skillsList');
   try {
     const data = await api('/api/skills');
     const skills = data.skills || [];
-    // A runtime_scope of "unavailable" withholds this profile's external roots
-    // (e.g. a chat turn on the profile is running). Don't cache that incomplete
-    // list, or reopening the panel keeps hiding the external skills until an
-    // unrelated cache reset (save/delete/profile switch) clears it.
-    if (data.runtime_scope !== 'unavailable') _skillsData = skills;
+    // Keep local skills usable while external roots are withheld, including for
+    // toggle/search actions, but retry on the next panel load until the profile
+    // scope is confirmed.
+    _skillsData = skills;
+    _skillsDataIncomplete = data.runtime_scope === 'unavailable';
     // Prune collapsed state to only keep categories present in fresh data,
     // avoiding stale keys when categories are renamed or removed server-side.
     const liveCats = new Set(skills.map(s => s.category || '(general)'));
@@ -5276,7 +5283,9 @@ async function saveSkillForm() {
     await api('/api/skills/save', {method:'POST', body: JSON.stringify({name, category: category||undefined, content})});
     showToast(_editingSkillName ? t('skill_updated') : t('skill_created'));
     _skillsData = null;
+    _skillsDataIncomplete = false;
     _cronSkillsCache = null;
+    _cronSkillsCacheIncomplete = false;
     if(typeof window!=='undefined'&&typeof window.invalidateSlashSkillCaches==='function') window.invalidateSlashSkillCaches();
     _editingSkillName = null;
     _skillPreFormDetail = null;
@@ -5316,7 +5325,9 @@ async function deleteCurrentSkill() {
     _currentSkillDetail = null;
     _skillPreFormDetail = null;
     _skillsData = null;
+    _skillsDataIncomplete = false;
     _cronSkillsCache = null;
+    _cronSkillsCacheIncomplete = false;
     if(typeof window!=='undefined'&&typeof window.invalidateSlashSkillCaches==='function') window.invalidateSlashSkillCaches();
     _skillMode = 'empty';
     const body = $('skillDetailBody');
@@ -7181,6 +7192,9 @@ async function switchToProfile(name) {
     if(typeof _clearPersistedModelState==='function') _clearPersistedModelState();
     else localStorage.removeItem('hermes-webui-model');
     _skillsData = null;
+    _skillsDataIncomplete = false;
+    _cronSkillsCache = null;
+    _cronSkillsCacheIncomplete = false;
     _workspaceList = null;
     if (data.default_model) window._defaultModel = data.default_model;
     if (data.default_model_provider) window._activeProvider = data.default_model_provider;
