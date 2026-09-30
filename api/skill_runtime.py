@@ -25,7 +25,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Generator
 
-import yaml
+from api import yaml_compat as yaml
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +74,10 @@ def profile_external_skill_dirs(profile_home: Path) -> list[Path]:
         if not isinstance(entry, str) or not entry.strip():
             continue
         expanded = _PATH_ENV_VAR.sub(expand_var, entry.strip())
+        # Replacement values can themselves contain tokens (including cycles).
+        # Never turn those unresolved tokens into literal filesystem roots.
+        if _PATH_ENV_VAR.search(expanded):
+            raise ValueError('Unresolved external skill path variable')
         if expanded == '~' or expanded.startswith('~/') or expanded.startswith('~\\'):
             expanded = str(HOME) + expanded[1:]
         elif expanded.startswith('~'):

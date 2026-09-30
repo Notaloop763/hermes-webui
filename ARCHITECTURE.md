@@ -577,9 +577,11 @@ streaming turn's mirrored `HERMES_HOME` (the same mirror described in §4.10).
 - `profile_external_skill_dirs()` reads the bound profile's `config.yaml` directly.
   It expands `$VAR` / `${VAR}` from that profile's runtime environment, forces
   `HERMES_HOME` to the bound home, and anchors relative paths there. `~` and `$HOME`
-  use the WebUI's stable shell home. Unresolved variables withhold external roots;
+  use the WebUI's stable shell home. Unresolved variables, including tokens introduced
+  by `.env` replacement values, withhold external roots;
   process environment and the Agent's expansion cache are never consulted. No cache
   is retained, so config and `.env` edits are observed on the next lookup.
+  YAML parsing uses `api.yaml_compat`, including managed ruamel-only runtimes.
 - The scope is trusted only when the Agent's routed-profile decision matches the
   profile WebUI resolved (`api.skill_runtime._routing_view()`). External roots are used
   only then; otherwise they are withheld (fail closed) so an unconfirmed scope can never
@@ -593,6 +595,11 @@ streaming turn's mirrored `HERMES_HOME` (the same mirror described in §4.10).
 - Skills, cron pickers, and both slash-command skill loaders use partial local results
   when scope is `unavailable`, but retry on the next lookup rather than treating them
   as a reusable complete list.
+- The Skills panel and cron picker share `_skillListsGeneration` in `panels.js`.
+  Both profile-switch paths and save/delete/toggle invalidations retire pending reads.
+  Each loader also owns a monotonically increasing request counter; only its newest
+  request in the current generation/profile may publish cache state or UI errors.
+  Toggle retains its updated local working set while invalidating older reads.
 
 ---
 
