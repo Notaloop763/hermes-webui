@@ -543,7 +543,7 @@ python3 -c "import hermes_constants; print(hasattr(hermes_constants, 'pin_proces
 
 **Symptom.** With several profiles, the Skills panel of profile A lists skills from profile B's `skills.external_dirs`, or the external roots configured for profile A do not appear at all. `/api/skills` reports `runtime_scope: "unavailable"`.
 
-**Why.** The WebUI resolves a profile's local skills root itself, but `skills.external_dirs` is read by the Agent helper `agent.skill_utils.get_external_skills_dirs()`, which resolves the configured paths through the Hermes home. The WebUI binds that lookup to the request profile (`ARCHITECTURE.md` §4.11). While a chat turn is streaming, the WebUI mirrors that turn's profile into `HERMES_HOME`; if the Agent's routed-profile decision cannot be matched to the profile WebUI resolved, the WebUI withholds the external roots (fail closed) instead of showing another profile's directories.
+**Why.** The WebUI binds external-root discovery to the request profile (`ARCHITECTURE.md` §4.12), reads that profile's `skills.external_dirs` directly, and expands variables from its runtime environment with `HERMES_HOME` fixed to the profile home. Relative paths start at that home; `~` and `$HOME` use the stable shell home. Variables missing from the profile environment withhold external roots instead of using another streaming profile's process environment. If the Agent's routed-profile decision cannot be matched to the profile WebUI resolved, external roots are also withheld. Local skills remain usable in panels, cron, and slash suggestions; incomplete lists are retried on the next lookup.
 
 **Diagnostic commands.**
 

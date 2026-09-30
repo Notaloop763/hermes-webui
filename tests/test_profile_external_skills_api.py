@@ -103,6 +103,43 @@ def test_skills_api_reads_external_dirs_from_request_profile(monkeypatch, tmp_pa
     assert skills["translation-local"]["category"] is None
 
 
+def test_home_variable_keeps_listing_and_content_in_request_profile(monkeypatch, tmp_path):
+    """Exercise the review trigger through real Agent scanning and HTTP handlers."""
+    from api import helpers, profiles, routes
+
+    root = tmp_path / 'root'
+    named = tmp_path / 'profiles' / 'named'
+    for home, skill_name in ((root, 'root-only'), (named, 'named-only')):
+        _write_skill(home / 'shared', skill_name)
+        _write_config(home, ['${HERMES_HOME}/shared'])
+        (home / 'shared' / skill_name / 'notes.txt').write_text(skill_name)
+    captured = _capture_json(monkeypatch, routes)
+    monkeypatch.setattr(helpers, 'j', routes.j)
+    # The root request must also ignore a streaming turn's mirrored home.
+    for profile, home, own, foreign, mirror in (
+        ('named', named, 'named-only', 'root-only', root),
+        ('default', root, 'root-only', 'named-only', named),
+    ):
+        monkeypatch.setenv('HERMES_HOME', str(mirror))
+        _patch_active_profile(monkeypatch, profiles, profile, home, root)
+        _patch_agent_routing(monkeypatch, routed=home != root)
+        routes.handle_get(MagicMock(), urlparse('/api/skills'))
+        assert {s['name'] for s in captured['payload']['skills']} == {own}
+        assert captured['payload']['runtime_scope'] in {'profile', 'legacy_process'}
+        routes.handle_get(MagicMock(), urlparse(f'/api/skills/content?name={own}'))
+        assert captured['payload']['success'] is True
+        routes.handle_get(MagicMock(), urlparse(
+            f'/api/skills/content?name={own}&file=notes.txt',
+        ))
+        assert captured['payload']['content'] == own
+        routes.handle_get(MagicMock(), urlparse(f'/api/skills/content?name={foreign}'))
+        assert captured['payload'].get('success') is not True
+        routes.handle_get(MagicMock(), urlparse(
+            f'/api/skills/content?name={foreign}&file=notes.txt',
+        ))
+        assert captured['status'] == 404
+
+
 def test_skills_content_resolves_external_skill_from_request_profile(monkeypatch, tmp_path):
     """Skill detail lookup must search the same profile-scoped external roots."""
     from api import profiles, routes

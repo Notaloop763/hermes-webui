@@ -731,10 +731,16 @@ one, else `os.environ['HERMES_HOME']`. Without a scope, a named profile could li
 another profile's external roots, and — mid-turn — the root profile could follow a
 streaming turn's mirrored `HERMES_HOME` (the same mirror described in §4.10).
 
-- `_active_skill_search_dirs_scoped()` in `api/routes.py` runs the Agent lookup inside
+- `_active_skill_search_dirs_scoped()` in `api/routes.py` resolves external roots inside
   `api.skill_runtime.skill_runtime_scope()`, which binds the request profile's home
   (root profile included) via `api.profiles.profile_env_for_active_request_readonly()`
   without touching `os.environ`, and restores it on exit.
+- `profile_external_skill_dirs()` reads the bound profile's `config.yaml` directly.
+  It expands `$VAR` / `${VAR}` from that profile's runtime environment, forces
+  `HERMES_HOME` to the bound home, and anchors relative paths there. `~` and `$HOME`
+  use the WebUI's stable shell home. Unresolved variables withhold external roots;
+  process environment and the Agent's expansion cache are never consulted. No cache
+  is retained, so config and `.env` edits are observed on the next lookup.
 - The scope is trusted only when the Agent's routed-profile decision matches the
   profile WebUI resolved (`api.skill_runtime._routing_view()`). External roots are used
   only then; otherwise they are withheld (fail closed) so an unconfirmed scope can never
@@ -745,6 +751,9 @@ streaming turn's mirrored `HERMES_HOME` (the same mirror described in §4.10).
   could not be confirmed, including a legacy Agent that cannot bind a home override;
   external roots withheld). The dirs-only `_active_skill_search_dirs()` used by skill content,
   linked-file and toggle lookups inherits the same fail-closed directory set.
+- Skills, cron pickers, and both slash-command skill loaders use partial local results
+  when scope is `unavailable`, but retry on the next lookup rather than treating them
+  as a reusable complete list.
 
 ---
 
