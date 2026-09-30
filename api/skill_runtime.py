@@ -3,29 +3,93 @@
 ``skills.external_dirs`` is read by ``agent.skill_utils.get_external_skills_dirs()``,
 which resolves the configured paths through the Hermes home: the context-local home
 override when the Agent provides one, else ``os.environ['HERMES_HOME']``. The WebUI
-resolves the request profile's local skills root itself, but that Agent helper reads
-the *process* home, so a named profile could list another profile's external roots
+resolves the request profile's local skills root itself, but that Agent helper expands
+variables from the process environment, so a named profile could list another
+profile's external roots
 (and, mid-turn, the root profile could follow a streaming turn's mirrored home).
 
 These helpers bind the request profile's home (root included, without touching
 ``os.environ``) and confirm the Agent's routing decision matches the profile the
 WebUI resolved, so external roots are used only when they provably belong to the
-request profile. The shape mirrors ``api.mcp_runtime``.
+request profile. Path expansion reads the bound profile's config and environment
+directly, avoiding the Agent's process environment and shared expansion cache.
+The scope shape mirrors ``api.mcp_runtime``.
 """
 
 from __future__ import annotations
 
 import logging
+import re
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Generator
 
+import yaml
+
 logger = logging.getLogger(__name__)
+
+_PATH_ENV_VAR = re.compile(r'\$(?:\{([^}]+)\}|([A-Za-z_][A-Za-z0-9_]*))')
+
+
+def profile_external_skill_dirs(profile_home: Path) -> list[Path]:
+    """Resolve external roots without the Agent's process-env expansion/cache.
+
+    Read fresh on each call: both config and profile .env can change, and the
+    Agent's config-signature-only cache cannot distinguish expansion contexts.
+    Never fall back to a streaming turn's process environment for path variables.
+    """
+    from api.paths import HOME
+    from api.profiles import filter_runtime_env_for_gateway_parity, get_profile_runtime_env
+
+    config_path = profile_home / 'config.yaml'
+    if not config_path.exists():
+        return []
+    config = yaml.safe_load(config_path.read_text(encoding='utf-8')) or {}
+    if not isinstance(config, dict):
+        raise ValueError('Invalid profile skills config')
+    skills = config.get('skills', {})
+    if not isinstance(skills, dict):
+        raise ValueError('Invalid profile skills config')
+    entries = skills.get('external_dirs', []) or []
+    if isinstance(entries, str):
+        entries = [entries]
+    if not isinstance(entries, list):
+        raise ValueError('Invalid external skill directories')
+
+    env = filter_runtime_env_for_gateway_parity(get_profile_runtime_env(profile_home))
+    env['HERMES_HOME'] = str(profile_home)
+    # Shell identity is not supplied by profile .env (gateway parity). Use the
+    # WebUI's stable shell home for ~ and $HOME, never a live process-env read.
+    env['HOME'] = str(HOME)
+
+    def expand_var(match):
+        key = match.group(1) or match.group(2)
+        if key not in env:
+            raise ValueError('Unresolved external skill path variable')
+        return env[key]
+
+    roots = []
+    for entry in entries:
+        if not isinstance(entry, str) or not entry.strip():
+            continue
+        expanded = _PATH_ENV_VAR.sub(expand_var, entry.strip())
+        if expanded == '~' or expanded.startswith('~/') or expanded.startswith('~\\'):
+            expanded = str(HOME) + expanded[1:]
+        elif expanded.startswith('~'):
+            raise ValueError('Unsupported external skill path home')
+        root = Path(expanded)
+        if not root.is_absolute():
+            root = profile_home / root
+        root = root.resolve()
+        if root.is_dir() and root not in roots:
+            roots.append(root)
+    return roots
+
 
 # Scope label reported by the Skills API.
 SCOPE_PROFILE = "profile"            # external roots bound to the request profile
-SCOPE_LEGACY = "legacy_process"      # Agent predates the home override; process-wide lookup
+SCOPE_LEGACY = "legacy_process"      # no routed predicate, but a bound home
 SCOPE_UNAVAILABLE = "unavailable"    # profile scope could not be confirmed; roots withheld
 
 
@@ -34,7 +98,7 @@ class SkillRuntimeScope:
     """How the current context sees the external skill-directory lookup.
 
     ``trusted``: external roots in this context belong to ``profile_home``.
-    ``legacy``: the Agent has no context-local home override (process-wide lookup).
+    ``legacy``: the Agent has no routed predicate, but a home override is bound.
     """
 
     profile_home: Path
