@@ -14,6 +14,7 @@ import types
 from pathlib import Path
 
 import yaml
+import pytest
 
 
 class FakeAgent:
@@ -249,6 +250,25 @@ def test_profile_path_expansion_uses_own_env_and_observes_edits(monkeypatch, tmp
     # A variable known only to the live process must never contribute a root.
     (home / 'config.yaml').write_text('skills:\n  external_dirs: ["$SKILL_ROOT"]\n')
     (home / '.env').write_text('')
+    assert routes._active_skill_search_dirs_scoped(home / 'skills') == (
+        [home / 'skills'], 'unavailable',
+    )
+
+
+@pytest.mark.parametrize('replacement', ['$MISSING_ROOT', '${MISSING_ROOT}', '${SKILL_ROOT}'])
+def test_replacement_values_cannot_introduce_unresolved_path_tokens(monkeypatch, tmp_path, replacement):
+    from api import profiles, routes
+
+    root = tmp_path / 'root'
+    home = tmp_path / 'named'
+    (home / 'skills').mkdir(parents=True)
+    # A literal-token directory exists: accepting unresolved replacement tokens
+    # would make it visible instead of rejecting the unconfirmed external root.
+    (home / replacement).mkdir()
+    _patch_profile(monkeypatch, profiles, 'named', home, root)
+    _install_fake_agent(monkeypatch, external_dirs_by_home={home: ['$SKILL_ROOT']},
+                        process_home=root)
+    (home / '.env').write_text(f'SKILL_ROOT={replacement}\n')
     assert routes._active_skill_search_dirs_scoped(home / 'skills') == (
         [home / 'skills'], 'unavailable',
     )
