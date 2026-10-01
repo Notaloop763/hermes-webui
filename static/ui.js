@@ -5451,6 +5451,19 @@ function _reasoningEffortQuery(){
   return qs?('?'+qs):'';
 }
 
+function _applyReasoningSaveResult(context, profile, effort, status){
+  // The server saved the originating session. This single-entry UI cache
+  // belongs only to the visible context; revisiting another session refetches.
+  if(profile!==((S&&S.activeProfile)||'default')) return;
+  const params=new URLSearchParams(context).toString();
+  const key=params?('?'+params):'';
+  if(key!==_reasoningEffortQuery()) return;
+  // A GET dispatched before this save must not restore the old effort later.
+  ++_reasoningFetchSeq;
+  _lastReasoningFetchKey=key;
+  _applyReasoningChip(effort, status);
+}
+
 function _applyReasoningOptions(supportedEfforts){
   const dd=$('composerReasoningDropdown');
   if(!dd) return;
@@ -5673,13 +5686,15 @@ document.addEventListener('click',function(e){
     // silently ignore the Default click and leave the toggle one-way off-only.
     // (#6219 round-3)
     if(opt){
-      const payload=Object.assign({effort:effort},_reasoningEffortContext());
+      const context=_reasoningEffortContext();
+      const profile=(S&&S.activeProfile)||'default';
+      const payload=Object.assign({effort:effort},context);
       api('/api/reasoning',{method:'POST',body:JSON.stringify(payload)})
         .then(function(st){
           // For Default (effort=''), the returned reasoning_effort is '' (clear)
           // — display 'Default' rather than an empty toast.
           const display=(st&&st.reasoning_effort)||effort||'Default';
-          _applyReasoningChip((st&&st.reasoning_effort)||effort, st||{});
+          _applyReasoningSaveResult(context, profile, (st&&st.reasoning_effort)||effort, st||{});
           showToast('🧠 Reasoning effort set to '+display);
         })
         .catch(function(){showToast('🧠 Failed to set effort');});
