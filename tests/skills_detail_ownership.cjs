@@ -1,6 +1,6 @@
 // Complete production modules and real DOM; only transport/unrelated panels are fixtures.
 const fs = require('fs');
-const {chromium} = require('playwright');
+const {chromium} = require(process.argv[3]);
 const root = process.argv[2];
 const template = fs.readFileSync(root+'/static/index.html','utf8');
 const list = template.slice(template.indexOf('<div class="panel-view" id="panelSkills">'), template.indexOf('<!-- Memory panel -->'));
@@ -19,20 +19,25 @@ const setup = () => {
   window.highlightCode=()=>events.push(['highlight']);
   window.requestAnimationFrame=callback=>frames.push(callback);
   window.setInterval=()=>0; window.syncTopbar=()=>{};
-  window.requests=[]; window.confirmations=[];
+  window.requests=[]; window.requestLog=[]; window.confirmations=[];
   window.showConfirmDialog=()=>new Promise(resolve=>confirmations.push(resolve));
   window.api=(path,opts)=>{
+    const ordinal=requestLog.length+1;
+    requestLog.push({ordinal,path,profile:S.activeProfile});
     if(path==='/api/profile/switch')return Promise.resolve({active:JSON.parse(opts.body).name});
-    return new Promise((resolve,reject)=>requests.push({path,opts,profile:S.activeProfile,resolve,reject}));
+    return new Promise((resolve,reject)=>requests.push({ordinal,path,opts,profile:S.activeProfile,resolve,reject}));
   };
 };
 const compose = () => {
   renderSessionList=async()=>{}; renderSessionListFromCache=()=>{}; showSessionListSkeleton=()=>{};
   closeSessionActionMenu=()=>{}; startGatewaySSE=()=>{}; applyBotName=()=>{};
-  _profileSwitchPanelLoad=async()=>{}; _refreshProfileSwitchBackground=()=>{};
+  _refreshProfileSwitchBackground=()=>{};
   _resetCronUnreadForProfileSwitch=()=>{}; _openProfileSwitchSessionBrowser=()=>{};
   refreshProfileTransitionReasoningChip=()=>{}; invalidateSlashSkillCaches=()=>{};
   _closeMobileSidebarAfterPanelSelection=()=>{};
+  window.syncAppTitlebar=()=>{};
+  window.mutationsAfter=ordinal=>requestLog.filter(r=>r.ordinal>ordinal &&
+    ['/api/skills/save','/api/skills/delete','/api/skills/toggle'].includes(r.path));
   window.flush=()=>new Promise(resolve=>setTimeout(resolve,0));
   window.payload=profile=>({runtime_scope:'profile',skills:[{name:'same',category:profile,description:profile+' description',disabled:profile!=='A'}]});
   window.content=profile=>({content:profile+' private content',linked_files:{references:['ref.md']}});
@@ -73,6 +78,7 @@ const compose = () => {
        const old=requests.at(-1);
        await window[switcher]('B'); $('fixtureProfile').textContent='B';
        if(returnA){await window[switcher]('A');$('fixtureProfile').textContent='A';}
+       const switchOrdinal=requestLog.length;
        const immediate=snapshot();
        const settleOld=async()=>{
          oldList.resolve(payload('A'));
@@ -87,7 +93,7 @@ const compose = () => {
        await populate(returnA?'A-new':'B'); const before=snapshot();
        if(!oldFirst)await settleOld();
        const after=snapshot();
-       return {immediate,neutral,before,after,extraRequests:requests.filter(r=>r.profile!=='A'&&r.path.includes('/save')).length};
+       return {immediate,neutral,before,after,requestLog,mutationsAfterSwitch:mutationsAfter(switchOrdinal)};
      },{switcher,oldFirst,returnA,action,error});
      reports.push({switcher,oldFirst,returnA,action,error,...report});
      await page.close();
@@ -156,6 +162,8 @@ const compose = () => {
     const report=await page.evaluate(async({action,timeout})=>{
       const fetches=[];
       window.fetch=(url,opts)=>{
+        const path=new URL(url,location.href).pathname;
+        requestLog.push({ordinal:requestLog.length+1,path,profile:S.activeProfile});
         if(url.includes('/api/profile/switch'))return Promise.resolve(new Response(JSON.stringify({active:'B'}),{headers:{'Content-Type':'application/json'}}));
         return new Promise((resolve,reject)=>fetches.push({url,opts,resolve,reject}));
       };
@@ -164,14 +172,45 @@ const compose = () => {
       if(action==='toggle')toggleSkill('same',true);
       if(action==='save')saveSkillForm();
       if(action==='delete'){deleteCurrentSkill();confirmations.at(-1)(true);await flush();}
-      await _switchProfileForSessionLoad('B');const before=snapshot();
+      await _switchProfileForSessionLoad('B');const before=snapshot();const switchOrdinal=requestLog.length;
       const error=timeout?Object.assign(Error('timed out'),{name:'TimeoutError'}):new TypeError('network disconnected');
       fetches[0].reject(error);await flush();
-      return {before,after:snapshot(),fetches:fetches.length};
+      return {before,after:snapshot(),fetches:fetches.length,requestLog,mutationsAfterSwitch:mutationsAfter(switchOrdinal)};
     },{action,timeout});
     reports.push({scenario:'transport-'+action,timeout,...report});await page.close();
   }
-  for(const action of ['save','delete','delete-cancel']){
+  // Real panel lifecycle: visible switch awaits the destination load; hidden
+  // switch reloads only on reopening through switchPanel -> loadSkills.
+  for(const visibility of ['visible','hidden'])for(const oldFirst of [false,true]){
+    const page=await browser.newPage();
+    await page.route('http://127.0.0.1:8789/fixture',r=>r.fulfill({contentType:'text/html',body:html}));
+    await page.goto('http://127.0.0.1:8789/fixture');await page.evaluate(setup);
+    for(const file of ['sessions.js','panels.js'])await page.addScriptTag({content:fs.readFileSync(root+'/static/'+file,'utf8')});
+    await page.evaluate(compose);
+    const report=await page.evaluate(async({visibility,oldFirst})=>{
+      await populate('A');
+      if(visibility==='visible')await switchPanel('skills');
+      _skillsDataIncomplete=true;loadSkills();const old=requests.at(-1);
+      let switched=false;
+      const transition=switchToProfile('B').then(()=>{switched=true;});
+      await flush();
+      const switchOrdinal=requestLog.findLast(r=>r.path==='/api/profile/switch').ordinal;
+      const immediate=snapshot();
+      if(visibility==='visible' && switched)throw Error('visible switch did not await destination load');
+      if(visibility==='hidden')await transition;
+      if(oldFirst){old.resolve(payload('A'));await flush();}
+      const reopening=visibility==='hidden'?switchPanel('skills'):transition;
+      await flush();const destination=requests.at(-1);
+      if(destination===old || destination.profile!=='B' || destination.path!=='/api/skills')throw Error('missing destination panel load');
+      destination.resolve(payload('B'));await reopening;await transition;
+      const before=snapshot();
+      if(!oldFirst){old.resolve(payload('A'));await flush();}
+      return {immediate,before,after:snapshot(),destinationRequests:requestLog.filter(r=>r.profile==='B'&&r.path==='/api/skills').length,
+        requestLog,mutationsAfterSwitch:mutationsAfter(switchOrdinal)};
+    },{visibility,oldFirst});
+    reports.push({scenario:'panel-'+visibility,oldFirst,...report});await page.close();
+  }
+  for(const action of ['toggle','save','delete','delete-cancel']){
     const page=await browser.newPage();
     await page.route('http://127.0.0.1:8789/fixture',r=>r.fulfill({contentType:'text/html',body:html}));
     await page.goto('http://127.0.0.1:8789/fixture');await page.evaluate(setup);
@@ -179,6 +218,9 @@ const compose = () => {
     await page.evaluate(compose);
     const report=await page.evaluate(async action=>{
       await populate('A');
+      await switchToProfile('B');
+      const switchOrdinal=requestLog.length;
+      await populate('B');
       if(action==='delete-cancel'){
         cancelSkillForm();
         const pending=deleteCurrentSkill();confirmations.at(-1)(false);await pending;
@@ -186,14 +228,18 @@ const compose = () => {
         const last=requests.at(-1);
         if(!last.path.includes('&file='))throw Error('cancelled deletion retired current links');
         last.resolve(content('linked'));await flush();
-        return snapshot();
+        return {...snapshot(),switchOrdinal,mutationRequests:mutationsAfter(switchOrdinal)};
       }
-      const pending=action==='save'?saveSkillForm():deleteCurrentSkill();
+      const pending=action==='toggle'?toggleSkill('same',false):action==='save'?saveSkillForm():deleteCurrentSkill();
       if(action==='delete'){confirmations.at(-1)(true);await flush();}
       requests.at(-1).resolve({ok:true});await flush();
-      requests.at(-1).resolve(action==='save'?payload('A'):{runtime_scope:'profile',skills:[]});await flush();
+      if(action==='toggle'){
+        await pending;cancelSkillForm();
+        return {...snapshot(),switchOrdinal,mutationRequests:mutationsAfter(switchOrdinal)};
+      }
+      requests.at(-1).resolve(action==='save'?payload('B'):{runtime_scope:'profile',skills:[]});await flush();
       if(action==='save')requests.at(-1).resolve(content('saved'));
-      await pending;return snapshot();
+      await pending;return {...snapshot(),switchOrdinal,mutationRequests:mutationsAfter(switchOrdinal)};
     },action);
     reports.push({happy:action,...report});await page.close();
   }

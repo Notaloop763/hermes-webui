@@ -39,14 +39,23 @@ npx eslint --no-config-lookup -c eslint.runtime-guard.config.mjs "static/**/*.js
 ## Skills profile ownership regression
 
 Run `./scripts/test.sh tests/test_skills_runtime_scope_cache.py tests/test_skills_detail_ownership.py`.
-The detail regression needs Node Playwright and installed Chromium (`NODE_PATH`
-and `PLAYWRIGHT_BROWSERS_PATH` may select existing installations). It composes the
+The detail regression uses Python Playwright's version-matched bundled Node driver
+and installed Chromium, as provided by the pytest CI job. For local setup, install
+`playwright` in the repo `.venv` and run `.venv/bin/python -m playwright install chromium`;
+`PLAYWRIGHT_BROWSERS_PATH` may select an existing matching browser installation.
+With Python Playwright present, a missing driver/browser fails the test instead of
+silently skipping because an npm dependency is absent. It composes the
 complete production panels/session modules with the real Skills list/detail/form
 DOM and deferred API fixtures; it does not start a server or access Agent state.
 It checks both accepted profile-switch paths, immediate clearing of populated edit
 state, both response orders, A→B→A, same-named skills, stale errors and writes,
 confirmation after switching, same-profile supersession, mutation reloads, and
-queued markdown/code enhancements, and current-profile save/delete completion.
+queued markdown/code enhancements, and destination-profile toggle/save/delete
+completion after a real A→B transition. Visible Skills switches await the real
+destination load; hidden Skills reopen through `switchPanel('skills')`. Every
+mutation is recorded with request ordinal, exact path, and captured profile;
+stale work must emit no new save/delete/toggle request after switching, including
+late confirmation and A→B→A.
 Supplemental cases compose the actual `workspace.js` API helper over a deferred
 fetch fixture to check that stale network failures do not retry and stale timeouts
 do not toast. This proves browser publication/transport ownership rather than real
