@@ -600,6 +600,18 @@ streaming turn's mirrored `HERMES_HOME` (the same mirror described in §4.10).
   Each loader also owns a monotonically increasing request counter; only its newest
   request in the current generation/profile may publish cache state or UI errors.
   Toggle retains its updated local working set while invalidating older reads.
+- Accepted profile transitions synchronously reset the Skills list, selected detail,
+  edit/create form, header actions, search, and collapsed categories. Detail/file reads
+  and save/delete continuations own the profile, detail generation, and newest detail
+  request (deletion also owns its newest confirmation/write request); navigating
+  or entering/cancelling a form retires older continuations.
+  Toggle responses own the profile generation and newest request for that skill name.
+  Stale success/error responses and queued markdown/code enhancements cannot mutate
+  the new profile's cache, DOM, status, or toast. Deletion confirmation is revalidated
+  before sending the write; save/delete reloads are revalidated before reopening or
+  acknowledging the result. Skills panel requests disable transport retries so a
+  retry cannot use a later profile cookie, and suppress generic timeout toasts in
+  favor of ownership-checked error handling.
 
 ---
 

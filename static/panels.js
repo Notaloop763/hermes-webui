@@ -1625,7 +1625,7 @@ function _loadCronSkills(force=false){
   // later form opens. Only a confirmed result is a reusable cache entry.
   if(_cronSkillsCache&&!force)_bindCronSkillPicker();
   if(!force&&_cronSkillsCache&&!_cronSkillsCacheIncomplete)return;
-  api('/api/skills').then(d=>{
+  api('/api/skills', {timeoutToast: false, retries: 0}).then(d=>{
     if(generation!==_skillListsGeneration||request!==_cronSkillsLoadRequest||profile!==S.activeProfile)return;
     _cronSkillsCache=d.skills||[];
     _cronSkillsCacheIncomplete=d.runtime_scope==='unavailable';
@@ -4942,7 +4942,7 @@ async function loadSkills() {
   if (_skillsData && !_skillsDataIncomplete) { renderSkills(_skillsData); return; }
   const box = $('skillsList');
   try {
-    const data = await api('/api/skills');
+    const data = await api('/api/skills', {timeoutToast: false, retries: 0});
     if (generation !== _skillListsGeneration || request !== _skillsLoadRequest || profile !== S.activeProfile) return;
     const skills = data.skills || [];
     // Keep local skills usable while external roots are withheld, including for
@@ -5037,12 +5037,19 @@ function filterSkills() {
 
 
 async function toggleSkill(name, currentlyEnabled) {
+  const profile = S.activeProfile;
+  const generation = _skillDetailGeneration;
+  const request = (_skillToggleRequests.get(name) || 0) + 1;
+  _skillToggleRequests.set(name, request);
+  const owns = () => profile === S.activeProfile && generation === _skillDetailGeneration &&
+    request === _skillToggleRequests.get(name);
   const newEnabled = !currentlyEnabled;
   try {
     const result = await api('/api/skills/toggle', {
-      method: 'POST',
+      method: 'POST', timeoutToast: false, retries: 0,
       body: JSON.stringify({ name, enabled: newEnabled })
     });
+    if (!owns()) return;
     if (result && result.ok) {
       if (_skillsData) {
         const skill = _skillsData.find(s => s.name === name);
@@ -5055,7 +5062,7 @@ async function toggleSkill(name, currentlyEnabled) {
       setStatus((result && result.error) || t('skill_toggle_failed'));
     }
   } catch(e) {
-    setStatus(t('skill_toggle_failed') + e.message);
+    if (owns()) setStatus(t('skill_toggle_failed') + e.message);
   }
 }
 
@@ -5065,6 +5072,49 @@ let _currentSkillDetail = null; // { name, category, content }
 let _skillMode = 'empty'; // 'empty' | 'read' | 'create' | 'edit'
 let _skillPreFormDetail = null; // snapshot of previously-viewed skill when entering a form
 let _editingSkillName = null;
+
+// Detail navigation and mutations belong to the accepted profile generation.
+// Request identity also prevents an older same-profile selection from publishing.
+let _skillDetailGeneration = 0;
+let _skillDetailRequest = 0;
+let _skillDeleteRequest = 0;
+const _skillToggleRequests = new Map();
+
+function _skillDetailOwner() {
+  return { profile: S.activeProfile, generation: _skillDetailGeneration, request: _skillDetailRequest };
+}
+
+function _ownsSkillDetail(owner) {
+  return owner.profile === S.activeProfile && owner.generation === _skillDetailGeneration &&
+    owner.request === _skillDetailRequest;
+}
+
+function _clearSkillDetail() {
+  _currentSkillDetail = null;
+  _skillPreFormDetail = null;
+  _editingSkillName = null;
+  _skillMode = 'empty';
+  const body = $('skillDetailBody');
+  const empty = $('skillDetailEmpty');
+  const title = $('skillDetailTitle');
+  if (body) { body.innerHTML = ''; body.style.display = 'none'; }
+  if (empty) empty.style.display = '';
+  if (title) title.textContent = '';
+  _setSkillHeaderButtons('empty');
+}
+
+function resetSkillsForProfileTransition() {
+  invalidateSkillListCaches();
+  _skillDetailGeneration++;
+  _skillDetailRequest++;
+  _skillToggleRequests.clear();
+  _collapsedCats.clear();
+  const list = $('skillsList');
+  const search = $('skillsSearch');
+  if (list) list.innerHTML = '';
+  if (search) search.value = '';
+  _clearSkillDetail();
+}
 
 function _stripYamlFrontmatter(content) {
   if (!content) return { frontmatter: null, body: '' };
@@ -5077,9 +5127,10 @@ function _skillMarkdownHtml(markdown) {
   return `<div class="preview-md">${renderMd(markdown || '')}</div>`;
 }
 
-function _enhanceSkillMarkdown(root) {
+function _enhanceSkillMarkdown(root, owner = _skillDetailOwner()) {
   if (!root) return;
   requestAnimationFrame(() => {
+    if (!_ownsSkillDetail(owner)) return;
     const mdRoot = root.querySelector('.preview-md') || root;
     if (typeof highlightCode === 'function') highlightCode(mdRoot);
     if (typeof renderKatexBlocks === 'function') renderKatexBlocks(mdRoot);
@@ -5087,6 +5138,7 @@ function _enhanceSkillMarkdown(root) {
 }
 
 function _renderSkillDetail(name, content, linkedFiles) {
+  const owner = _skillDetailOwner();
   const title = $('skillDetailTitle');
   const body = $('skillDetailBody');
   const empty = $('skillDetailEmpty');
@@ -5115,7 +5167,10 @@ function _renderSkillDetail(name, content, linkedFiles) {
   body.innerHTML = `<div class="main-view-content skill-detail-content">${html}</div>`;
   _enhanceSkillMarkdown(body);
   body.querySelectorAll('.skill-linked-file').forEach(a => {
-    a.addEventListener('click', e => { e.preventDefault(); openSkillFile(a.dataset.skillName, a.dataset.skillFile); });
+    a.addEventListener('click', e => {
+      e.preventDefault();
+      if (_ownsSkillDetail(owner)) openSkillFile(a.dataset.skillName, a.dataset.skillFile);
+    });
   });
   body.style.display = '';
   if (empty) empty.style.display = 'none';
@@ -5152,13 +5207,15 @@ function _setSkillHeaderButtons(mode) {
 }
 
 async function openSkill(name, el) {
+  _skillDetailRequest++;
+  const owner = _skillDetailOwner();
+  _clearSkillDetail();
   // Highlight active skill in the sidebar list
   document.querySelectorAll('.skill-item').forEach(e => e.classList.remove('active'));
   if (el) el.classList.add('active');
-  _skillPreFormDetail = null;
-  _editingSkillName = null;
   try {
-    const data = await api(`/api/skills/content?name=${encodeURIComponent(name)}`);
+    const data = await api(`/api/skills/content?name=${encodeURIComponent(name)}`, {timeoutToast: false, retries: 0});
+    if (!_ownsSkillDetail(owner)) return;
     if (data && (data.success === false || data.error)) {
       const message = data.error || t('skill_load_failed');
       _renderSkillError(name, message);
@@ -5168,12 +5225,15 @@ async function openSkill(name, el) {
     _currentSkillDetail = { name, content: data.content || '', linked_files: data.linked_files || {} };
     _renderSkillDetail(name, data.content || '', data.linked_files || {});
     _closeMobileSidebarAfterPanelSelection();
-  } catch(e) { setStatus(t('skill_load_failed') + e.message); }
+  } catch(e) { if (_ownsSkillDetail(owner)) setStatus(t('skill_load_failed') + e.message); }
 }
 
 async function openSkillFile(skillName, filePath) {
+  _skillDetailRequest++;
+  const owner = _skillDetailOwner();
   try {
-    const data = await api(`/api/skills/content?name=${encodeURIComponent(skillName)}&file=${encodeURIComponent(filePath)}`);
+    const data = await api(`/api/skills/content?name=${encodeURIComponent(skillName)}&file=${encodeURIComponent(filePath)}`, {timeoutToast: false, retries: 0});
+    if (!_ownsSkillDetail(owner)) return;
     if (data && data.error) {
       _renderSkillError(skillName, data.error);
       setStatus(t('skill_file_load_failed') + data.error);
@@ -5199,6 +5259,8 @@ async function openSkillFile(skillName, filePath) {
     body.querySelectorAll('.skill-file-back').forEach(a => {
       a.addEventListener('click', e => {
         e.preventDefault();
+        if (!_ownsSkillDetail(owner)) return;
+        _skillDetailRequest++;
         if (_currentSkillDetail && _currentSkillDetail.name === a.dataset.skillName) {
           _renderSkillDetail(_currentSkillDetail.name, _currentSkillDetail.content, _currentSkillDetail.linked_files);
         } else {
@@ -5207,12 +5269,15 @@ async function openSkillFile(skillName, filePath) {
       });
     });
     if (isMd) _enhanceSkillMarkdown(body);
-    else requestAnimationFrame(() => { if (typeof highlightCode === 'function') highlightCode(); });
-  } catch(e) { setStatus(t('skill_file_load_failed') + e.message); }
+    else requestAnimationFrame(() => {
+      if (_ownsSkillDetail(owner) && typeof highlightCode === 'function') highlightCode(body);
+    });
+  } catch(e) { if (_ownsSkillDetail(owner)) setStatus(t('skill_file_load_failed') + e.message); }
 }
 
 function editCurrentSkill() {
   if (!_currentSkillDetail) return;
+  _skillDetailRequest++;
   const s = _currentSkillDetail;
   let category = '';
   if (_skillsData) {
@@ -5226,6 +5291,7 @@ function editCurrentSkill() {
 }
 
 function openSkillCreate() {
+  _skillDetailRequest++;
   if (typeof switchPanel === 'function' && _currentPanel !== 'skills') switchPanel('skills');
   _skillPreFormDetail = _currentSkillDetail ? { ..._currentSkillDetail } : null;
   _editingSkillName = null;
@@ -5272,6 +5338,7 @@ function _renderSkillForm({ name, category, content, isEdit }) {
 }
 
 function cancelSkillForm() {
+  _skillDetailRequest++;
   _editingSkillName = null;
   if (_skillPreFormDetail) {
     const snap = _skillPreFormDetail;
@@ -5305,16 +5372,20 @@ async function saveSkillForm() {
   errEl.style.display = 'none';
   if (!name) { errEl.textContent = t('skill_name_required'); errEl.style.display = ''; return; }
   if (!content.trim()) { errEl.textContent = t('content_required'); errEl.style.display = ''; return; }
+  _skillDetailRequest++;
+  const owner = _skillDetailOwner();
+  const isEdit = !!_editingSkillName;
   try {
-    await api('/api/skills/save', {method:'POST', body: JSON.stringify({name, category: category||undefined, content})});
-    showToast(_editingSkillName ? t('skill_updated') : t('skill_created'));
+    await api('/api/skills/save', {method:'POST', timeoutToast: false, retries: 0, body: JSON.stringify({name, category: category||undefined, content})});
+    if (!_ownsSkillDetail(owner)) return;
+    showToast(isEdit ? t('skill_updated') : t('skill_created'));
     invalidateSkillListCaches();
     if(typeof window!=='undefined'&&typeof window.invalidateSlashSkillCaches==='function') window.invalidateSlashSkillCaches();
     _editingSkillName = null;
     _skillPreFormDetail = null;
     await loadSkills();
+    if (!_ownsSkillDetail(owner)) return;
     // Reload the saved skill in read mode with fresh content
-    const row = document.querySelector(`.skill-item .skill-name`);
     const match = document.querySelectorAll('.skill-item');
     let targetEl = null;
     match.forEach(el => {
@@ -5322,7 +5393,10 @@ async function saveSkillForm() {
       if (nm && nm.textContent === name) targetEl = el;
     });
     await openSkill(name, targetEl);
-  } catch(e) { errEl.textContent = t('error_prefix') + e.message; errEl.style.display = ''; }
+  } catch(e) {
+    if (!_ownsSkillDetail(owner)) return;
+    errEl.textContent = t('error_prefix') + e.message; errEl.style.display = '';
+  }
 }
 
 // Back-compat aliases (delete flow + any old callers)
@@ -5331,6 +5405,9 @@ function toggleSkillForm(){ openSkillCreate(); }
 
 async function deleteCurrentSkill() {
   if (!_currentSkillDetail) return;
+  const request = ++_skillDeleteRequest;
+  const owner = _skillDetailOwner();
+  const owns = () => request === _skillDeleteRequest && _ownsSkillDetail(owner);
   const name = _currentSkillDetail.name;
   const message = t('skill_delete_confirm')
     ? t('skill_delete_confirm').replace('{0}', name)
@@ -5342,24 +5419,18 @@ async function deleteCurrentSkill() {
     danger: true,
     focusCancel: true,
   });
-  if (!ok) return;
+  if (!ok || !owns()) return;
   try {
-    await api('/api/skills/delete', { method:'POST', body: JSON.stringify({ name }) });
-    _currentSkillDetail = null;
-    _skillPreFormDetail = null;
+    await api('/api/skills/delete', { method:'POST', timeoutToast: false, retries: 0, body: JSON.stringify({ name }) });
+    if (!owns()) return;
     invalidateSkillListCaches();
     if(typeof window!=='undefined'&&typeof window.invalidateSlashSkillCaches==='function') window.invalidateSlashSkillCaches();
-    _skillMode = 'empty';
-    const body = $('skillDetailBody');
-    const empty = $('skillDetailEmpty');
-    const title = $('skillDetailTitle');
-    if (body) { body.innerHTML = ''; body.style.display = 'none'; }
-    if (empty) empty.style.display = '';
-    if (title) title.textContent = '';
-    _setSkillHeaderButtons('empty');
+    _skillDetailRequest++;
+    _clearSkillDetail();
+    const reloadOwner = _skillDetailOwner();
     await loadSkills();
-    showToast(t('skill_deleted') || 'Skill deleted');
-  } catch(e) { setStatus(t('error_prefix') + e.message); }
+    if (request === _skillDeleteRequest && _ownsSkillDetail(reloadOwner)) showToast(t('skill_deleted') || 'Skill deleted');
+  } catch(e) { if (owns()) setStatus(t('error_prefix') + e.message); }
 }
 
 // ── Memory (main view) ──
@@ -7168,7 +7239,7 @@ async function switchToProfile(name) {
     if (_switchGen !== _profileSwitchGeneration) return false;
     S.activeProfile = data.active || name;
     S.activeProfileIsDefault = !!data.is_default;
-    invalidateSkillListCaches();
+    resetSkillsForProfileTransition();
     if (typeof _resetCronUnreadForProfileSwitch === 'function') {
       _resetCronUnreadForProfileSwitch();
     }

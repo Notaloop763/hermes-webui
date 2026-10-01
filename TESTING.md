@@ -36,6 +36,22 @@ npm run lint:runtime
 npx eslint --no-config-lookup -c eslint.runtime-guard.config.mjs "static/**/*.js"
 ```
 
+## Skills profile ownership regression
+
+Run `./scripts/test.sh tests/test_skills_runtime_scope_cache.py tests/test_skills_detail_ownership.py`.
+The detail regression needs Node Playwright and installed Chromium (`NODE_PATH`
+and `PLAYWRIGHT_BROWSERS_PATH` may select existing installations). It composes the
+complete production panels/session modules with the real Skills list/detail/form
+DOM and deferred API fixtures; it does not start a server or access Agent state.
+It checks both accepted profile-switch paths, immediate clearing of populated edit
+state, both response orders, A→B→A, same-named skills, stale errors and writes,
+confirmation after switching, same-profile supersession, mutation reloads, and
+queued markdown/code enhancements, and current-profile save/delete completion.
+Supplemental cases compose the actual `workspace.js` API helper over a deferred
+fetch fixture to check that stale network failures do not retry and stale timeouts
+do not toast. This proves browser publication/transport ownership rather than real
+Agent behavior.
+
 ## Native raster redaction boundary
 
 Run `./scripts/test.sh tests/test_mpf_jpeg_redaction.py tests/test_raster_data_uri_redaction.py tests/test_security_redaction.py`.
