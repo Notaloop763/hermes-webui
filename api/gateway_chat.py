@@ -1252,9 +1252,12 @@ def _run_gateway_chat_streaming(
     usage = {"input_tokens": 0, "output_tokens": 0, "estimated_cost": 0}
     try:
         s = get_session(session_id)
-        from api.config import get_config  # imported lazily to avoid config-cycle churn
+        from api.config import get_config_for_profile_home  # imported lazily to avoid config-cycle churn
+        from api.profiles import get_hermes_home_for_profile
 
-        cfg = get_config()
+        # Detached workers have no request-local profile context. Resolve one
+        # session-owned config for reasoning fallback, overrides, and prefill.
+        cfg = get_config_for_profile_home(get_hermes_home_for_profile(s.profile))
         reasoning_effort = _gateway_reasoning_effort_for_request(
             cfg,
             model=model,

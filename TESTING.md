@@ -422,6 +422,26 @@ EXPECT:
   - The model chip remains unchanged when both sessions use the same model.
 FAIL: The reasoning control keeps the previously viewed session's value, resets after reload, or the next turn uses a stale effort.
 
+Repeat with different models: use a fast model with High/XHigh/Max in session A
+and a flagship model with Low in session B, selecting efforts supported by each
+model. Both the model and reasoning controls must restore together on desktop
+and narrow/mobile after A → B → A and reload. Capture before/after screenshots
+of both sessions for PR review.
+
+Configuration regressions are covered by `tests/test_session_reasoning_effort.py`:
+new-session model/effort defaults honor an external `HERMES_CONFIG_PATH` for the
+matching profile; Gateway legacy and runs API requests use the named session
+profile's reasoning default when no stored override exists. An explicit session
+override wins over both the named and process/root profile values.
+
+Delayed-save regressions are covered by `tests/test_reasoning_effort_save_race.py`.
+With a throttled connection, change A's effort through the dropdown or
+`/reasoning high`, then switch to B before the save returns. B must keep its own
+effort after the response and routine topbar sync; returning to A must fetch its
+saved effort. Repeat on desktop and mobile, and with a model, provider, or profile
+change while the save is pending. A save in an unchanged context must still update
+both desktop and mobile labels, even if an older reasoning GET returns afterward.
+
 ### T3.3: Context Badge Shares Footer Space Cleanly
 SETUP: Active session with at least one completed response.
 STEPS:
