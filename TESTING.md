@@ -38,6 +38,14 @@ npx eslint --no-config-lookup -c eslint.runtime-guard.config.mjs "static/**/*.js
 
 ## Skills profile ownership regression
 
+Run `./scripts/test.sh tests/test_skills_launch_environment.py tests/test_profile_external_skills_scope.py`
+for external-root path expansion. Fresh subprocesses exercise the production
+`/api/skills` handler with an Agent routing/scanner adapter and disposable homes.
+They cover root launch variables, renamed-root identity, profile `.env` precedence,
+named and isolated named profiles, and rejection of variables introduced after
+startup. Live environment changes before the resolver imports must not redirect
+the lookup. This is WebUI boundary proof, not real-Agent integration.
+
 Run `./scripts/test.sh tests/test_skills_runtime_scope_cache.py tests/test_skills_detail_ownership.py`.
 The detail regression uses Python Playwright's version-matched bundled Node driver
 and installed Chromium, as provided by the pytest CI job. For local setup, install

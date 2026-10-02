@@ -575,11 +575,16 @@ streaming turn's mirrored `HERMES_HOME` (the same mirror described in §4.10).
   (root profile included) via `api.profiles.profile_env_for_active_request_readonly()`
   without touching `os.environ`, and restores it on exit.
 - `profile_external_skill_dirs()` reads the bound profile's `config.yaml` directly.
-  It expands `$VAR` / `${VAR}` from that profile's runtime environment, forces
+  It expands `$VAR` / `${VAR}` from that profile's runtime environment. The root
+  home also inherits the immutable `api.paths.STARTUP_ENV` captured before config
+  and profile initialization, with profile `.env` values taking precedence.
+  Named homes use only their own runtime environment, even when pinned as the
+  process profile; the root is identified by its resolved home, not a display name
+  or the process anchor. The resolver forces
   `HERMES_HOME` to the bound home, and anchors relative paths there. `~` and `$HOME`
   use the WebUI's stable shell home. Unresolved variables, including tokens introduced
   by `.env` replacement values, withhold external roots;
-  process environment and the Agent's expansion cache are never consulted. No cache
+  the live process environment and the Agent's expansion cache are never consulted. No cache
   is retained, so config and `.env` edits are observed on the next lookup.
   YAML parsing uses `api.yaml_compat`, including managed ruamel-only runtimes.
 - The scope is trusted only when the Agent's routed-profile decision matches the
