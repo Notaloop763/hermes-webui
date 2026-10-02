@@ -380,10 +380,15 @@ and narrow/mobile after A → B → A and reload. Capture before/after screensho
 of both sessions for PR review.
 
 Configuration regressions are covered by `tests/test_session_reasoning_effort.py`:
-new-session model/effort defaults honor an external `HERMES_CONFIG_PATH` for the
-matching profile; Gateway legacy and runs API requests use the named session
+new-session model/effort defaults honor an external `HERMES_CONFIG_PATH` for root.
+With request-local context set to a named profile, a root/external config override
+must not replace that profile's model or effort; an override inside its own home
+still applies. Gateway legacy and runs API requests use the named session
 profile's reasoning default when no stored override exists. An explicit session
-override wins over both the named and process/root profile values.
+override wins over both the named and process/root profile values. With distinct
+root/named Gateway URLs and keys, the initial request's URL, Authorization header,
+and retained stream endpoint must all belong to the session's profile, matching
+the endpoint used for reattachment, Stop, and approval replies.
 
 Delayed-save regressions are covered by `tests/test_reasoning_effort_save_race.py`.
 With a throttled connection, change A's effort through the dropdown or

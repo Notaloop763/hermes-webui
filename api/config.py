@@ -723,7 +723,9 @@ def _load_yaml_config_file(config_path: Path) -> dict:
     return expanded if isinstance(expanded, dict) else {}
 
 
-def get_config_for_profile_home(profile_home: "Path | str | None") -> dict:
+def get_config_for_profile_home(
+    profile_home: "Path | str | None", *, isolate_config_override: bool = False,
+) -> dict:
     """Return the config dict for an explicit profile home directory.
 
     The streaming agent runs on a detached worker thread that does NOT inherit
@@ -740,8 +742,12 @@ def get_config_for_profile_home(profile_home: "Path | str | None") -> dict:
     the path the ambient resolver would pick (the common single-profile case),
     we return the cached ``get_config()`` to preserve in-memory overrides used
     by tests and runtime callers, and to honour an authoritative
-    ``HERMES_CONFIG_PATH`` override. Only when the session's profile home
-    diverges from the ambient path do we read the session profile's file
+    ``HERMES_CONFIG_PATH`` override. Session defaults and Gateway workers pass
+    ``isolate_config_override=True`` so a named profile never uses an override
+    outside its own home, even when request-local context selects that profile.
+    Settings/workspace callers retain their ambient read/write authority.
+    When the session's profile home diverges from the ambient path or its
+    isolated override check rejects the ambient file, we read the profile file
     directly — a pure read with no global cache mutation, so it is race-free
     across concurrent sessions on different profiles. Divergent profiles stay
     isolated: a nonexistent home returns ``{}`` and an existing home without a
@@ -763,9 +769,18 @@ def get_config_for_profile_home(profile_home: "Path | str | None") -> dict:
     # the aliased home would be bypassed in favor of a direct — wrong — read.
     target = _cfg_safe_resolve(target)
     try:
-        from api.profiles import get_active_hermes_home
+        from api.profiles import get_active_hermes_home, get_hermes_home_for_profile
 
-        if _cfg_safe_resolve(Path(get_active_hermes_home()).expanduser()) == target:
+        root_home = _cfg_safe_resolve(get_hermes_home_for_profile("default"))
+        override = os.getenv("HERMES_CONFIG_PATH")
+        override_matches = (
+            not isolate_config_override
+            or not override
+            or target == root_home
+            or _cfg_safe_resolve(Path(override).expanduser()).is_relative_to(target)
+        )
+        active_home = _cfg_safe_resolve(Path(get_active_hermes_home()).expanduser())
+        if override_matches and active_home == target:
             return get_config()
     except Exception:
         pass
@@ -775,7 +790,11 @@ def get_config_for_profile_home(profile_home: "Path | str | None") -> dict:
     # whose directory doesn't physically exist yet (fresh install, monkeypatched
     # cfg) must still resolve through get_config(), not return {} (#4516 gate).
     try:
-        if _cfg_safe_resolve(_get_config_path().parent) == target:
+        config_path = _cfg_safe_resolve(_get_config_path())
+        if config_path.parent == target or (
+            isolate_config_override and target != root_home
+            and config_path.is_relative_to(target)
+        ):
             return get_config()
     except Exception:
         pass

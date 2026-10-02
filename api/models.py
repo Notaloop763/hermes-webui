@@ -5697,7 +5697,9 @@ def _profile_default_model_state(profile=None):
     default_provider = None
     try:
         from api.profiles import get_hermes_home_for_profile
-        config_data = _cfg.get_config_for_profile_home(get_hermes_home_for_profile(profile))
+        config_data = _cfg.get_config_for_profile_home(
+            get_hermes_home_for_profile(profile), isolate_config_override=True,
+        )
     except Exception:
         config_data = {}
 
@@ -5715,7 +5717,9 @@ def _profile_default_reasoning_effort(profile=None):
     """Return the profile reasoning preference for a newly-created session."""
     try:
         from api.profiles import get_hermes_home_for_profile
-        config_data = _cfg.get_config_for_profile_home(get_hermes_home_for_profile(profile))
+        config_data = _cfg.get_config_for_profile_home(
+            get_hermes_home_for_profile(profile), isolate_config_override=True,
+        )
     except Exception:
         config_data = {}
     agent_cfg = config_data.get("agent", {}) if isinstance(config_data, dict) else {}
