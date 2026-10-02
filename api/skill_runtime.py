@@ -39,8 +39,12 @@ def profile_external_skill_dirs(profile_home: Path) -> list[Path]:
     Agent's config-signature-only cache cannot distinguish expansion contexts.
     Never fall back to a streaming turn's process environment for path variables.
     """
-    from api.paths import HOME
-    from api.profiles import filter_runtime_env_for_gateway_parity, get_profile_runtime_env
+    from api.paths import HOME, STARTUP_ENV
+    from api.profiles import (
+        _DEFAULT_HERMES_HOME,
+        filter_runtime_env_for_gateway_parity,
+        get_profile_runtime_env,
+    )
 
     config_path = profile_home / 'config.yaml'
     if not config_path.exists():
@@ -57,7 +61,11 @@ def profile_external_skill_dirs(profile_home: Path) -> list[Path]:
     if not isinstance(entries, list):
         raise ValueError('Invalid external skill directories')
 
-    env = filter_runtime_env_for_gateway_parity(get_profile_runtime_env(profile_home))
+    # Only the actual root home inherits launch variables. A named profile,
+    # including one pinned as the process profile, keeps its own environment.
+    # Compare resolved homes rather than a display name or the process anchor.
+    env = dict(STARTUP_ENV) if profile_home.resolve() == _DEFAULT_HERMES_HOME.resolve() else {}
+    env.update(filter_runtime_env_for_gateway_parity(get_profile_runtime_env(profile_home)))
     env['HERMES_HOME'] = str(profile_home)
     # Shell identity is not supplied by profile .env (gateway parity). Use the
     # WebUI's stable shell home for ~ and $HOME, never a live process-env read.
