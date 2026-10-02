@@ -8,6 +8,9 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 
 
+# All 132 browser schedules run in one item. Allow the bounded 180-second
+# controller to finish (or report its own timeout) under CI's --timeout=60.
+@pytest.mark.timeout(240)
 def test_production_skills_detail_and_mutation_ownership():
     pytest.importorskip('playwright', reason='Python Playwright browser prerequisite is unavailable')
     # CI installs Python Playwright, whose driver includes the version-matched
