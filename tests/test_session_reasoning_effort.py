@@ -308,40 +308,19 @@ def test_named_request_new_session_defaults_stay_in_profile(
     assert config.get_config_for_profile_home(work, isolate_config_override=True)["agent"]["reasoning_effort"] == expected
 
 
-@pytest.mark.parametrize("http_error", [False, True], ids=["success", "auth-error"])
-@pytest.mark.parametrize("work_key", ["work-test-key", ""], ids=["profile-key", "no-profile-key"])
-@pytest.mark.parametrize("session_effort, expected", [(None, "high"), ("xhigh", "xhigh")])
-@pytest.mark.parametrize("runs_api", [False, True], ids=["legacy-api", "runs-api"])
-def test_gateway_worker_resolves_reasoning_from_session_profile(
-    isolated_reasoning_profiles, tmp_path, monkeypatch, session_effort, expected, runs_api, work_key, http_error
-):
-    # Simulate a detached worker with root ambient config and a named-profile
-    # legacy session. Exercise real config resolution and outbound JSON encoding.
-    assert config.get_config()["agent"]["reasoning_effort"] == "low"
-    session = Session(
-        session_id="gateway-profile-effort", profile="work", model="gpt-5",
-        model_provider="openai", workspace=str(tmp_path), reasoning_effort=session_effort,
-    )
+def _run_gateway_turn(session, stream_id, tmp_path, monkeypatch, *, runs_api, http_error=False):
+    """Run the real Gateway worker with an intercepted transport.
+
+    Returns ``(captured_posts, emitted_events)`` where each captured POST is
+    ``(url, authorization, retained_endpoint, payload)``.
+    """
     models.SESSIONS[session.session_id] = session
-    stream_id = "gateway-profile-effort-stream"
     session.active_stream_id = stream_id
     session.pending_user_message = "hello"
     channel = config.create_stream_channel()
     events = channel.subscribe()
     monkeypatch.setitem(config.STREAMS, stream_id, channel)
     monkeypatch.setenv("HERMES_WEBUI_GATEWAY_USE_RUNS_API", "1" if runs_api else "0")
-    root, work = isolated_reasoning_profiles
-    for name, home in (("root", root), ("work", work)):
-        (home / ".env").write_text(
-            f"HERMES_WEBUI_GATEWAY_BASE_URL=http://{name}-gateway:8650\n"
-            f"HERMES_WEBUI_GATEWAY_API_KEY={work_key if name == 'work' else 'root-test-key'}\n"
-        )
-    monkeypatch.delenv("API_SERVER_KEY", raising=False)
-    monkeypatch.delenv("HERMES_WEBUI_GATEWAY_BASE_URL", raising=False)
-    monkeypatch.setenv("HERMES_WEBUI_GATEWAY_API_KEY", "root-test-key")
-    monkeypatch.setattr(profiles, "_loaded_profile_env_keys", {
-        "HERMES_WEBUI_GATEWAY_API_KEY",
-    })
     monkeypatch.setattr(gateway_chat, "gateway_supports_approval", lambda *a: True)
     monkeypatch.setattr(gateway_chat, "gateway_approval_unavailable_reason", lambda *a: None)
     # Avoid external platform discovery in system-prompt preparation.
@@ -368,22 +347,178 @@ def test_gateway_worker_resolves_reasoning_from_session_profile(
 
     monkeypatch.setattr(gateway_chat.urllib.request, "urlopen", urlopen)
     gateway_chat._run_gateway_chat_streaming(
-        session.session_id, "hello", "gpt-5", str(tmp_path), stream_id,
-        model_provider="openai",
+        session.session_id, "hello", session.model, str(tmp_path), stream_id,
+        model_provider=session.model_provider,
+    )
+    assert captured, "worker did not construct a Gateway request"
+    assert stream_id not in gateway_chat._STREAM_ENDPOINTS
+    return captured, [events.get_nowait() for _ in range(events.qsize())]
+
+
+@pytest.mark.parametrize("http_error", [False, True], ids=["success", "auth-error"])
+@pytest.mark.parametrize("work_key", ["work-test-key", ""], ids=["profile-key", "no-profile-key"])
+@pytest.mark.parametrize("session_effort, expected", [(None, "high"), ("xhigh", "xhigh")])
+@pytest.mark.parametrize("runs_api", [False, True], ids=["legacy-api", "runs-api"])
+def test_gateway_worker_resolves_reasoning_from_session_profile(
+    isolated_reasoning_profiles, tmp_path, monkeypatch, session_effort, expected, runs_api, work_key, http_error
+):
+    # Simulate a detached worker with root ambient config and a named-profile
+    # legacy session. Exercise real config resolution and outbound JSON encoding.
+    assert config.get_config()["agent"]["reasoning_effort"] == "low"
+    session = Session(
+        session_id="gateway-profile-effort", profile="work", model="gpt-5",
+        model_provider="openai", workspace=str(tmp_path), reasoning_effort=session_effort,
+    )
+    stream_id = "gateway-profile-effort-stream"
+    root, work = isolated_reasoning_profiles
+    for name, home in (("root", root), ("work", work)):
+        (home / ".env").write_text(
+            f"HERMES_WEBUI_GATEWAY_BASE_URL=http://{name}-gateway:8650\n"
+            f"HERMES_WEBUI_GATEWAY_API_KEY={work_key if name == 'work' else 'root-test-key'}\n"
+        )
+    monkeypatch.delenv("API_SERVER_KEY", raising=False)
+    monkeypatch.delenv("HERMES_WEBUI_GATEWAY_BASE_URL", raising=False)
+    monkeypatch.setenv("HERMES_WEBUI_GATEWAY_API_KEY", "root-test-key")
+    monkeypatch.setattr(profiles, "_loaded_profile_env_keys", {
+        "HERMES_WEBUI_GATEWAY_API_KEY",
+    })
+    captured, emitted = _run_gateway_turn(
+        session, stream_id, tmp_path, monkeypatch, runs_api=runs_api, http_error=http_error,
     )
 
-    assert captured, "worker did not construct a Gateway request"
     url, authorization, endpoint, payload = captured[0]
     assert url.startswith("http://work-gateway:8650/")
     assert authorization == (f"Bearer {work_key}" if work_key else None)
     assert endpoint == ("http://work-gateway:8650", work_key)
     assert payload["reasoning_effort"] == expected
     if http_error:
-        emitted = [events.get_nowait() for _ in range(events.qsize())]
         error = next(data for event, data, *_ in emitted if event == "apperror")
         if runs_api:
             assert error["type"] == "auth_mismatch"
         else:
             assert error["type"] == "gateway_auth_error"
             assert error["hint"].startswith("Check that" if work_key else "Set ")
-    assert stream_id not in gateway_chat._STREAM_ENDPOINTS
+
+
+@pytest.fixture
+def external_root_with_named_active(isolated_reasoning_profiles, tmp_path, monkeypatch):
+    """External root HERMES_CONFIG_PATH while the sticky active profile is ``work``."""
+    root, work = isolated_reasoning_profiles
+    external = tmp_path / "mounted" / "config.yaml"
+    external.parent.mkdir()
+    external.write_text(
+        "agent:\n  reasoning_effort: xhigh\n"
+        "webui_gateway_base_url: http://external-root:8650\n"
+    )
+    (root / "config.yaml").write_text(
+        "agent:\n  reasoning_effort: low\nwebui_gateway_base_url: http://root-file:8650\n"
+    )
+    (root / ".env").write_text("HERMES_WEBUI_GATEWAY_API_KEY=root-test-key\n")
+    (work / ".env").write_text("HERMES_WEBUI_GATEWAY_API_KEY=work-test-key\n")
+    monkeypatch.setenv("HERMES_CONFIG_PATH", str(external))
+    monkeypatch.setattr(profiles, "_active_profile", "work")
+    # The active named profile's key is loaded into the process environment.
+    monkeypatch.setenv("HERMES_WEBUI_GATEWAY_API_KEY", "work-test-key")
+    monkeypatch.setattr(profiles, "_loaded_profile_env_keys", {"HERMES_WEBUI_GATEWAY_API_KEY"})
+    monkeypatch.delenv("API_SERVER_KEY", raising=False)
+    monkeypatch.delenv("HERMES_WEBUI_GATEWAY_BASE_URL", raising=False)
+    config.reload_config()
+    assert profiles.get_active_hermes_home() == work
+    return root, work, external
+
+
+@pytest.mark.parametrize("root_config_exists", [True, False], ids=["root-file", "no-root-file"])
+@pytest.mark.parametrize("session_kind", ["legacy", "new"])
+@pytest.mark.parametrize("runs_api", [False, True], ids=["legacy-api", "runs-api"])
+def test_root_gateway_turn_honors_external_config_while_named_profile_active(
+    external_root_with_named_active, tmp_path, monkeypatch, runs_api, session_kind, root_config_exists
+):
+    root, _work, _external = external_root_with_named_active
+    if not root_config_exists:
+        (root / "config.yaml").unlink()
+        config.reload_config()
+    if session_kind == "new":
+        session = models.new_session(workspace=str(tmp_path), profile="default", model="gpt-5")
+        session.model_provider = "openai"
+        assert session.reasoning_effort == "xhigh"
+    else:
+        session = Session(
+            session_id="gateway-root-external", profile="default", model="gpt-5",
+            model_provider="openai", workspace=str(tmp_path), reasoning_effort=None,
+        )
+    captured, _ = _run_gateway_turn(
+        session, f"{session.session_id}-stream", tmp_path, monkeypatch, runs_api=runs_api,
+    )
+
+    url, authorization, endpoint, payload = captured[0]
+    assert url.startswith("http://external-root:8650/")
+    assert authorization == "Bearer root-test-key"
+    assert endpoint == ("http://external-root:8650", "root-test-key")
+    assert payload["reasoning_effort"] == "xhigh"
+
+
+def test_root_override_under_named_profile_is_not_root_config(
+    external_root_with_named_active, monkeypatch
+):
+    root, work, _external = external_root_with_named_active
+    nested = work / "mounted" / "config.yaml"
+    nested.parent.mkdir()
+    nested.write_text("agent:\n  reasoning_effort: high\n")
+    monkeypatch.setenv("HERMES_CONFIG_PATH", str(nested))
+    config.reload_config()
+    root_cfg = config.get_config_for_profile_home(root, isolate_config_override=True)
+    assert root_cfg["agent"]["reasoning_effort"] == "low"
+
+
+@pytest.mark.parametrize("config_location", ["root", "external", "unset"])
+def test_reasoning_get_legacy_session_uses_session_profile_config(
+    isolated_reasoning_profiles, tmp_path, monkeypatch, config_location
+):
+    root, _work = isolated_reasoning_profiles
+    if config_location == "external":
+        external = tmp_path / "external.yaml"
+        external.write_text("agent:\n  reasoning_effort: low\n")
+        monkeypatch.setenv("HERMES_CONFIG_PATH", str(external))
+    elif config_location == "unset":
+        monkeypatch.delenv("HERMES_CONFIG_PATH", raising=False)
+    config.reload_config()
+    session = Session(
+        session_id="legacy-work-chip", profile="work", model="gpt-5",
+        model_provider="openai", workspace=str(tmp_path), reasoning_effort=None,
+    )
+    models.SESSIONS[session.session_id] = session
+
+    handler = _DummyHandler()
+    with patch("api.routes._session_id_visible_to_request_profile", return_value=True):
+        handle_get(
+            handler,
+            urlparse("/api/reasoning?model=gpt-5&provider=openai&session_id=legacy-work-chip"),
+        )
+
+    assert handler.status == 200
+    # Same source as both backends: the session profile's config, not ambient.
+    assert handler.payload()["reasoning_effort"] == "high"
+    assert _gateway_reasoning_effort_for_request(
+        config.get_config_for_profile_home(
+            profiles.get_hermes_home_for_profile("work"), isolate_config_override=True,
+        ),
+        model="gpt-5", model_provider="openai",
+    ) == "high"
+
+
+def test_reasoning_get_root_legacy_session_honors_external_config_while_named_active(
+    external_root_with_named_active, tmp_path
+):
+    session = Session(
+        session_id="legacy-root-chip", profile="default", model="gpt-5",
+        model_provider="openai", workspace=str(tmp_path), reasoning_effort=None,
+    )
+    models.SESSIONS[session.session_id] = session
+    handler = _DummyHandler()
+    with patch("api.routes._session_id_visible_to_request_profile", return_value=True):
+        handle_get(
+            handler,
+            urlparse("/api/reasoning?model=gpt-5&provider=openai&session_id=legacy-root-chip"),
+        )
+    assert handler.status == 200
+    assert handler.payload()["reasoning_effort"] == "xhigh"
