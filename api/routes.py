@@ -14510,8 +14510,19 @@ def handle_get(handler, parsed) -> bool:
             except KeyError:
                 return bad(handler, "Session not found", 404)
             session_effort = getattr(reasoning_session, "reasoning_effort", None)
-            if session_effort is not None:
-                effort_kwargs["effort_override"] = session_effort
+            if session_effort is None:
+                # Legacy session: fall back to the session profile's config,
+                # the same source both backends resolve at run time.
+                from api.profiles import get_hermes_home_for_profile
+
+                profile_cfg = get_config_for_profile_home(
+                    get_hermes_home_for_profile(getattr(reasoning_session, "profile", None)),
+                    isolate_config_override=True,
+                )
+                agent_cfg = profile_cfg.get("agent") if isinstance(profile_cfg, dict) else None
+                if isinstance(agent_cfg, dict):
+                    session_effort = agent_cfg.get("reasoning_effort")
+            effort_kwargs["effort_override"] = session_effort
         return j(
             handler,
             get_reasoning_status(

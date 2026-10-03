@@ -744,7 +744,9 @@ def get_config_for_profile_home(
     by tests and runtime callers, and to honour an authoritative
     ``HERMES_CONFIG_PATH`` override. Session defaults and Gateway workers pass
     ``isolate_config_override=True`` so a named profile never uses an override
-    outside its own home, even when request-local context selects that profile.
+    outside its own home, even when request-local context selects that profile;
+    in that mode the root profile always uses an override that is not under
+    ``<root>/profiles``, whichever named profile is process-active.
     Settings/workspace callers retain their ambient read/write authority.
     When the session's profile home diverges from the ambient path or its
     isolated override check rejects the ambient file, we read the profile file
@@ -773,11 +775,20 @@ def get_config_for_profile_home(
 
         root_home = _cfg_safe_resolve(get_hermes_home_for_profile("default"))
         override = os.getenv("HERMES_CONFIG_PATH")
+        override_path = _cfg_safe_resolve(Path(override).expanduser()) if override else None
+        # An external override is the root profile's config whichever named
+        # profile is process-active, unless it lives under a named profile home.
+        if (
+            isolate_config_override and override_path is not None
+            and target == root_home
+            and not override_path.is_relative_to(root_home / "profiles")
+        ):
+            return get_config()
         override_matches = (
             not isolate_config_override
-            or not override
+            or override_path is None
             or target == root_home
-            or _cfg_safe_resolve(Path(override).expanduser()).is_relative_to(target)
+            or override_path.is_relative_to(target)
         )
         active_home = _cfg_safe_resolve(Path(get_active_hermes_home()).expanduser())
         if override_matches and active_home == target:
