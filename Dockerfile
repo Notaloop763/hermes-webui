@@ -1,4 +1,9 @@
-FROM python:3.12-slim
+# Python 3.13 from Debian 13 (trixie), matching the agent image's interpreter
+# location (/usr/bin/python3.13, stdlib /usr/lib/python3.13) so a Mnemosyne
+# side venv created here is usable by the agent container too. The WebUI project
+# supports Python 3.11-3.13 (pyproject requires-python >=3.11; scripts/test.sh
+# probes python3.13 first).
+FROM debian:13.4
 
 LABEL maintainer="nesquena"
 LABEL description="Hermes Web UI — browser interface for Hermes Agent"
@@ -26,12 +31,15 @@ RUN apt-get update -y --fix-missing --no-install-recommends \
     openssh-client \
     git \
     xz-utils \
+    python3 \
+    python3-dev \
+    python3-venv \
     && apt-get upgrade -y \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
 # ── SQLite upgrade ──────────────────────────────────────────────────────────
-# The python:3.12-slim base ships SQLite 3.46.1 (Debian Trixie), which is
+# The Debian 13 base ships SQLite 3.46.1 (Trixie), which is
 # vulnerable to the WAL-reset corruption bug discovered March 2026.
 # https://sqlite.org/wal.html#walresetbug
 #
