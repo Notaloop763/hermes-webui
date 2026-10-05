@@ -56,7 +56,7 @@ def test_ui_posts_reasoning_context_with_effort():
     src = read("static/ui.js")
     assert "function _reasoningEffortContext()" in src
     assert "new URLSearchParams(_reasoningEffortContext())" in src
-    assert "Object.assign({effort:effort},_reasoningEffortContext())" in src
+    assert "Object.assign({effort:effort},context)" in src
 
 
 def test_reasoning_post_route_threads_model_context():
