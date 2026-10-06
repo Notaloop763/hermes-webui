@@ -44,11 +44,19 @@ vm.runInContext(commands.slice(commands.indexOf('function cmdReasoning('),
 const run = code=>vm.runInContext(code,context);
 const status = effort=>({reasoning_effort:effort,supported_efforts:['low','high']});
 run('syncReasoningChip()'); requests.at(-1).ok(status('low'));
-if(entry==='dropdown') {
-  const option={dataset:{effort:'high'}};
-  clicks[0]({target:{closest(selector){return selector==='.reasoning-option'?option:null;}}});
-} else run("cmdReasoning('high')");
-const post = requests.find(r=>r.options?.method==='POST');
+function pick(effort) {
+  if(entry==='dropdown') {
+    const option={dataset:{effort}};
+    clicks[0]({target:{closest(selector){return selector==='.reasoning-option'?option:null;}}});
+  } else run(`cmdReasoning('${effort}')`);
+  return requests.filter(r=>r.options?.method==='POST').at(-1);
+}
+const post = pick('high');
+// A newer pick in the same chat resolves first; the older save lands last.
+if(change==='newer_save') pick('low').ok(status('low'));
+if(change==='newer_save_failed') {
+  pick('low').fail(new Error('boom'));
+}
 let oldGet;
 if(change==='old_get') {
   run('fetchReasoningChip()'); oldGet=requests.at(-1);
@@ -67,7 +75,13 @@ if(change==='session'||change==='model'||change==='provider') {
 post.ok(status('high'));
 if(oldGet) oldGet.ok(status('low'));
 const afterSave = els.composerReasoningLabel.textContent;
+const beforeSync = requests.length;
 run('syncReasoningChip()');
+if(change==='newer_save_failed') {
+  // The failed newest save must not leave a cached chip: resync reads the server.
+  if(requests.length!==beforeSync+1) throw new Error('no refetch after failed save');
+  requests.at(-1).ok(status('low'));
+}
 const afterSync = els.composerReasoningLabel.textContent;
 // Returning to A must read its persisted setting instead of borrowing B's cache.
 if(change==='session') {
@@ -81,7 +95,11 @@ process.stdout.write(JSON.stringify({afterSave,afterSync,
 
 
 @pytest.mark.parametrize("entry", ["dropdown", "command"])
-@pytest.mark.parametrize("change", ["session", "model", "provider", "profile", "unchanged", "old_get"])
+@pytest.mark.parametrize(
+    "change",
+    ["session", "model", "provider", "profile", "unchanged", "old_get",
+     "newer_save", "newer_save_failed"],
+)
 def test_delayed_save_keeps_its_context(tmp_path, entry, change):
     driver = tmp_path / "driver.js"
     driver.write_text(DRIVER)

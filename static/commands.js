@@ -1996,14 +1996,16 @@ function cmdReasoning(args){
     // The next turn rebuilds the cached agent with this session-owned value.
     const context=_reasoningEffortContext();
     const profile=(S&&S.activeProfile)||'default';
+    const saveSeq=_beginReasoningSave();
     const payload=Object.assign({effort:arg},context);
     api('/api/reasoning',{method:'POST',body:JSON.stringify(payload)})
       .then(function(st){
         const eff=(st && st.reasoning_effort)||arg;
         showToast(BRAIN+' Reasoning effort: '+eff+' (saved; applies to next turn)');
-        _applyReasoningSaveResult(context, profile, eff, st||{});
+        _applyReasoningSaveResult(saveSeq, context, profile, eff, st||{});
       })
       .catch(function(e){
+        _failReasoningSave(saveSeq);
         showToast(BRAIN+' Failed to set effort: '+(e && e.message ? e.message : arg));
       });
     return true;

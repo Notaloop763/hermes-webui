@@ -2955,6 +2955,7 @@ from api.config import (
     get_reasoning_status,
     set_reasoning_display,
     set_reasoning_effort,
+    normalize_reasoning_effort,
     create_stream_channel,
     get_config,
     get_webui_session_save_mode,
@@ -16270,29 +16271,32 @@ def handle_post(handler, parsed) -> bool:
                 provider_id = str(body.get("provider") or "").strip() or None
                 base_url = str(body.get("base_url") or "").strip() or None
                 session_id = str(body.get("session_id") or "").strip() or None
-                reasoning_session = None
+                normalized_effort = normalize_reasoning_effort(effort)
                 if session_id:
+                    # Profile visibility for body session_id is enforced by
+                    # _guard_request_session_visibility before routing.
                     try:
                         reasoning_session = _get_or_materialize_session(session_id)
                     except KeyError:
                         return bad(handler, "Session not found", 404)
                     except PermissionError:
                         return bad(handler, "Read-only imported sessions cannot be updated from WebUI", 403)
-                status = set_reasoning_effort(
-                    effort,
-                    model_id=model_id,
-                    provider_id=provider_id,
-                    base_url=base_url,
-                )
-                if reasoning_session is not None:
+                    # Save the session before the profile default so a failed
+                    # session write never leaves only config.yaml changed. The
+                    # cached agent is rebuilt on its next turn because
+                    # reasoning_config is part of the agent cache signature.
                     with _get_session_agent_lock(session_id):
-                        reasoning_session.reasoning_effort = str(effort or "").strip().lower()
+                        reasoning_session.reasoning_effort = normalized_effort
                         reasoning_session.save()
-                    # Cache eviction can commit agent lifecycle state and may do
-                    # provider I/O, so keep it outside the session mutation lock.
-                    from api.config import _evict_session_agent
-                    _evict_session_agent(session_id)
-                return j(handler, status)
+                return j(
+                    handler,
+                    set_reasoning_effort(
+                        effort,
+                        model_id=model_id,
+                        provider_id=provider_id,
+                        base_url=base_url,
+                    ),
+                )
             return bad(handler, "reasoning: must supply 'display' or 'effort'")
         except ValueError as e:
             return bad(handler, str(e))
@@ -29575,12 +29579,9 @@ def _handle_session_import(handler, body):
     model = body.get("model", DEFAULT_MODEL)
     reasoning_effort = body.get("reasoning_effort")
     if reasoning_effort is not None:
-        reasoning_effort = str(reasoning_effort or "").strip().lower()
-        if (
-            reasoning_effort
-            and reasoning_effort != "none"
-            and reasoning_effort not in api_config.VALID_REASONING_EFFORTS
-        ):
+        try:
+            reasoning_effort = api_config.normalize_reasoning_effort(reasoning_effort)
+        except ValueError:
             return bad(handler, "Invalid reasoning_effort")
     s = Session(
         title=title,

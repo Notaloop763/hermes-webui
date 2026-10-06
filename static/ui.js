@@ -5451,9 +5451,24 @@ function _reasoningEffortQuery(){
   return qs?('?'+qs):'';
 }
 
-function _applyReasoningSaveResult(context, profile, effort, status){
+// Monotonic save counter: only the most recently dispatched effort save may
+// update the chip, so an older save resolving late cannot undo a newer pick.
+let _reasoningSaveSeq=0;
+
+function _beginReasoningSave(){
+  return ++_reasoningSaveSeq;
+}
+
+function _failReasoningSave(saveSeq){
+  // The newest save failed, so the chip may show an older save's value. Drop
+  // the cache so the next sync re-reads what the server actually stored.
+  if(saveSeq===_reasoningSaveSeq) _lastReasoningFetchKey=null;
+}
+
+function _applyReasoningSaveResult(saveSeq, context, profile, effort, status){
   // The server saved the originating session. This single-entry UI cache
   // belongs only to the visible context; revisiting another session refetches.
+  if(saveSeq!==_reasoningSaveSeq) return;
   if(profile!==((S&&S.activeProfile)||'default')) return;
   const params=new URLSearchParams(context).toString();
   const key=params?('?'+params):'';
@@ -5688,16 +5703,20 @@ document.addEventListener('click',function(e){
     if(opt){
       const context=_reasoningEffortContext();
       const profile=(S&&S.activeProfile)||'default';
+      const saveSeq=_beginReasoningSave();
       const payload=Object.assign({effort:effort},context);
       api('/api/reasoning',{method:'POST',body:JSON.stringify(payload)})
         .then(function(st){
           // For Default (effort=''), the returned reasoning_effort is '' (clear)
           // — display 'Default' rather than an empty toast.
           const display=(st&&st.reasoning_effort)||effort||'Default';
-          _applyReasoningSaveResult(context, profile, (st&&st.reasoning_effort)||effort, st||{});
+          _applyReasoningSaveResult(saveSeq, context, profile, (st&&st.reasoning_effort)||effort, st||{});
           showToast('🧠 Reasoning effort set to '+display);
         })
-        .catch(function(){showToast('🧠 Failed to set effort');});
+        .catch(function(){
+          _failReasoningSave(saveSeq);
+          showToast('🧠 Failed to set effort');
+        });
       closeReasoningDropdown();
     }
   }

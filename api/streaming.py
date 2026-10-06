@@ -11360,6 +11360,7 @@ def _run_agent_streaming(
 
             # Per-session toolset override (#493): if the session has
             # enabled_toolsets set, use that instead of the global config.
+            _session_meta = None
             try:
                 from api.models import Session, SESSION_DIR
                 _session_path = SESSION_DIR / f"{session_id}.json"
@@ -11473,11 +11474,24 @@ def _run_agent_streaming(
 
             # Prefer the session-owned effort so switching conversations restores
             # the same runtime setting shown by the composer. Legacy sessions
-            # without that metadata continue to inherit the profile/CLI value.
+            # without that metadata continue to inherit the profile/CLI value,
+            # read from the same isolated session-profile config as the chip
+            # and the Gateway worker (_cfg stays ambient-aware for toolsets).
             try:
+                _session_effort = getattr(_session_meta, 'reasoning_effort', None)
+                if _session_effort is None:
+                    _session_effort = getattr(s, 'reasoning_effort', None)
+                _effort_cfg = _cfg
+                if _session_effort is None:
+                    try:
+                        _effort_cfg = _get_config_for_home(
+                            _profile_home, isolate_config_override=True,
+                        )
+                    except Exception:
+                        logger.warning("isolated reasoning config read failed; using session config", exc_info=True)
                 _effort = resolve_session_reasoning_effort(
-                    _cfg,
-                    session_effort=getattr(_session_meta, 'reasoning_effort', None),
+                    _effort_cfg,
+                    session_effort=_session_effort,
                     model_id=resolved_model,
                     provider_id=resolved_provider,
                     base_url=resolved_base_url,

@@ -784,11 +784,12 @@ def get_config_for_profile_home(
             and not override_path.is_relative_to(root_home / "profiles")
         ):
             return get_config()
+        # Root is handled above; an override under <root>/profiles belongs to
+        # that named profile, never to root, so root must not match it here.
         override_matches = (
             not isolate_config_override
             or override_path is None
-            or target == root_home
-            or override_path.is_relative_to(target)
+            or (target != root_home and override_path.is_relative_to(target))
         )
         active_home = _cfg_safe_resolve(Path(get_active_hermes_home()).expanduser())
         if override_matches and active_home == target:
@@ -6156,6 +6157,20 @@ def set_reasoning_display(show: bool) -> dict:
     return get_reasoning_status()
 
 
+def normalize_reasoning_effort(effort) -> str:
+    """Return the canonical stored form of a ``/reasoning`` level.
+
+    ``""`` means provider default. Raises ``ValueError`` for unknown levels.
+    """
+    raw = str(effort or "").strip().lower()
+    if raw and raw != "none" and raw not in VALID_REASONING_EFFORTS:
+        raise ValueError(
+            f"Unknown reasoning effort '{effort}'. "
+            f"Valid: none, {', '.join(VALID_REASONING_EFFORTS)}."
+        )
+    return raw
+
+
 def set_reasoning_effort(
     effort: str,
     *,
@@ -6177,12 +6192,7 @@ def set_reasoning_effort(
 
     Raises ``ValueError`` on any other unrecognised level so callers can 400.
     """
-    raw = str(effort or "").strip().lower()
-    if raw and raw != "none" and raw not in VALID_REASONING_EFFORTS:
-        raise ValueError(
-            f"Unknown reasoning effort '{effort}'. "
-            f"Valid: none, {', '.join(VALID_REASONING_EFFORTS)}."
-        )
+    raw = normalize_reasoning_effort(effort)
     config_path = _get_config_path()
     with _cfg_lock:
         config_data = _load_yaml_config_file(config_path)
