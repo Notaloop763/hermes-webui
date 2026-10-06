@@ -775,7 +775,12 @@ def get_config_for_profile_home(
 
         root_home = _cfg_safe_resolve(get_hermes_home_for_profile("default"))
         override = os.getenv("HERMES_CONFIG_PATH")
-        override_path = _cfg_safe_resolve(Path(override).expanduser()) if override else None
+        # Resolve the folder, not the file: a symlinked config.yaml belongs to the
+        # profile home it sits in, not to wherever its target lives.
+        override_path = None
+        if override:
+            _override_raw = Path(override).expanduser()
+            override_path = _cfg_safe_resolve(_override_raw.parent) / _override_raw.name
         # An external override is the root profile's config whichever named
         # profile is process-active, unless it lives under a named profile home.
         if (
