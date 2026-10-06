@@ -5490,7 +5490,13 @@ function _applyReasoningSaveResult(saveSeq, context, profile, effort, status){
   if(profile!==((S&&S.activeProfile)||'default')) return;
   const params=new URLSearchParams(context).toString();
   const key=params?('?'+params):'';
-  if(key!==_reasoningEffortQuery()) return;
+  if(key!==_reasoningEffortQuery()){
+    // Same chat, different model/provider: a GET for the new key may have
+    // read the pre-save value, so re-read it rather than keep a stale cache.
+    const current=_reasoningEffortContext();
+    if(context.session_id&&current.session_id===context.session_id) fetchReasoningChip();
+    return;
+  }
   // A GET dispatched before this save must not restore the old effort later.
   ++_reasoningFetchSeq;
   _lastReasoningFetchKey=key;

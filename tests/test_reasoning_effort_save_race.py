@@ -76,7 +76,12 @@ function pick(effort) {
   if(change==='session'||change==='model'||change==='provider') {
     run('syncReasoningChip()'); requests.at(-1).ok(status('low')); await flush();
   }
+  const beforeSaveResult = requests.length;
   post.ok(status('high')); await flush();
+  // A model/provider change in the same chat re-reads the stored value.
+  const resync = requests.slice(beforeSaveResult).find(r=>!r.options);
+  const resynced = Boolean(resync);
+  if(resync) { resync.ok(status('high')); await flush(); }
   if(serialized!==null) {
     const second = posts().at(-1);
     if(second===post) throw new Error('newer save never dispatched');
@@ -97,7 +102,7 @@ function pick(effort) {
     run("S.session.session_id='A';syncReasoningChip()");
     requests.at(-1).ok(status('high')); await flush();
   }
-  process.stdout.write(JSON.stringify({afterSave,afterSync,serialized,refetched,
+  process.stdout.write(JSON.stringify({afterSave,afterSync,serialized,refetched,resynced,
     mobile:els.composerMobileReasoningLabel.textContent,
     restored:els.composerReasoningLabel.textContent}));
 })().catch(e=>{console.error(e); process.exit(1);});
@@ -130,6 +135,14 @@ def test_delayed_save_keeps_its_context(tmp_path, entry, change):
         # The older save's late response must not claim the chip; the failed
         # newest save drops the cache so the next sync reads the stored value.
         assert out["refetched"] is True
+        assert out["afterSync"] == "High"
+        return
+    if change in ("model", "provider"):
+        # The save landed for this chat under its old model; the chip re-reads
+        # the stored value for the new model instead of keeping the stale GET.
+        assert out["resynced"] is True
+        assert out["afterSave"] == "High"
+        assert out["refetched"] is False
         assert out["afterSync"] == "High"
         return
     expected = "High" if change in ("unchanged", "old_get") else "Low"

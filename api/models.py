@@ -5721,7 +5721,10 @@ def _profile_default_reasoning_effort(profile=None):
             None, get_hermes_home_for_profile(profile),
         )
     except Exception:
-        return ""
+        # Stay legacy (None) so the turn-time fallback still reads the profile
+        # instead of pinning this chat to the provider default.
+        logger.warning("profile reasoning default read failed for %r", profile, exc_info=True)
+        return None
 
 
 def new_session(workspace=None, model=None, profile=None, model_provider=None, project_id=None, worktree_info=None, enabled_toolsets=None):

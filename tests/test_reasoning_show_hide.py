@@ -467,7 +467,7 @@ class TestReasoningRoutes:
 
     def test_post_api_reasoning_accepts_effort(self):
         src = read('api/routes.py')
-        assert 'set_reasoning_effort' in src, (
+        assert 'write_reasoning_effort' in src, (
             "POST /api/reasoning must route effort changes through "
-            "set_reasoning_effort"
+            "write_reasoning_effort"
         )

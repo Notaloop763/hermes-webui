@@ -2954,7 +2954,7 @@ from api.config import (
     model_with_provider_context,
     get_reasoning_status,
     set_reasoning_display,
-    set_reasoning_effort,
+    write_reasoning_effort,
     normalize_reasoning_effort,
     effective_session_reasoning_effort,
     create_stream_channel,
@@ -16269,46 +16269,62 @@ def handle_post(handler, parsed) -> bool:
                 session_id = str(body.get("session_id") or "").strip() or None
                 normalized_effort = normalize_reasoning_effort(effort)
 
-                def _save_profile_default():
-                    return set_reasoning_effort(
-                        effort,
+                def _reasoning_status():
+                    return get_reasoning_status(
                         model_id=model_id,
                         provider_id=provider_id,
                         base_url=base_url,
                     )
 
-                if not session_id:
-                    return j(handler, _save_profile_default())
-                # Profile visibility for body session_id is enforced by
-                # _guard_request_session_visibility before routing.
-                try:
-                    reasoning_session = _get_or_materialize_session(session_id)
-                except KeyError:
-                    return bad(handler, "Session not found", 404)
-                except PermissionError:
-                    return bad(handler, "Read-only imported sessions cannot be updated from WebUI", 403)
+                reasoning_session = None
+                if session_id:
+                    # Profile visibility for body session_id is enforced by
+                    # _guard_request_session_visibility before routing.
+                    try:
+                        reasoning_session = _get_or_materialize_session(session_id)
+                    except KeyError:
+                        return bad(handler, "Session not found", 404)
+                    except PermissionError:
+                        # Read-only, messaging and subagent chats cannot own an
+                        # effort; keep master's profile-default-only save.
+                        reasoning_session = None
+                if reasoning_session is None:
+                    write_reasoning_effort(effort)
+                    return j(handler, _reasoning_status())
                 # One serialized step per session: overlapping POSTs for the same
-                # chat cannot interleave their session and profile writes. The
-                # session is saved first so a failed save never changes only
-                # config.yaml; a failed profile write restores the session. The
-                # cached agent is rebuilt on its next turn because
-                # reasoning_config is part of the agent cache signature.
+                # chat cannot interleave their session and profile writes. Only
+                # local file writes run under the lock; the capability lookup
+                # (possible network I/O) runs after it is released. The session
+                # is saved first so a failed save never changes only config.yaml;
+                # a failed profile write restores the session. The cached agent
+                # is rebuilt on its next turn because reasoning_config is part of
+                # the agent cache signature.
                 with _get_session_agent_lock(session_id):
                     previous_effort = getattr(reasoning_session, "reasoning_effort", None)
                     reasoning_session.reasoning_effort = normalized_effort
                     try:
-                        reasoning_session.save()
+                        # A preference change is not conversation activity.
+                        reasoning_session.save(touch_updated_at=False)
                     except Exception:
                         # Keep the cached session equal to its sidecar.
                         reasoning_session.reasoning_effort = previous_effort
                         raise
                     try:
-                        status = _save_profile_default()
+                        write_reasoning_effort(effort)
                     except Exception:
                         reasoning_session.reasoning_effort = previous_effort
-                        reasoning_session.save()
+                        try:
+                            reasoning_session.save(touch_updated_at=False)
+                        except Exception:
+                            # The sidecar kept the new value; match it in memory
+                            # and surface the original profile-write error.
+                            reasoning_session.reasoning_effort = normalized_effort
+                            logger.warning(
+                                "reasoning effort rollback save failed for %s",
+                                session_id, exc_info=True,
+                            )
                         raise
-                return j(handler, status)
+                return j(handler, _reasoning_status())
             return bad(handler, "reasoning: must supply 'display' or 'effort'")
         except ValueError as e:
             return bad(handler, str(e))

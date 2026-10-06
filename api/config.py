@@ -5957,6 +5957,14 @@ def coerce_reasoning_effort_for_model(
     return raw
 
 
+def _config_reasoning_effort(config_data) -> str:
+    """Return a config dict's ``agent.reasoning_effort`` ("" when unset)."""
+    agent_cfg = config_data.get("agent") if isinstance(config_data, dict) else None
+    if not isinstance(agent_cfg, dict):
+        return ""
+    return str(agent_cfg.get("reasoning_effort") or "").strip().lower()
+
+
 def resolve_session_reasoning_effort(
     config_data,
     *,
@@ -5971,11 +5979,9 @@ def resolve_session_reasoning_effort(
     empty string (provider default). Legacy sessions store ``None`` and inherit
     the active profile's CLI-compatible ``agent.reasoning_effort`` value.
     """
-    cfg = config_data if isinstance(config_data, dict) else {}
-    agent_cfg = cfg.get("agent", {}) if isinstance(cfg, dict) else {}
-    effort_raw = agent_cfg.get("reasoning_effort") if isinstance(agent_cfg, dict) else None
-    if session_effort is not None:
-        effort_raw = session_effort
+    effort_raw = session_effort
+    if effort_raw is None:
+        effort_raw = _config_reasoning_effort(config_data)
     return coerce_reasoning_effort_for_model(
         effort_raw,
         model_id,
@@ -5994,11 +6000,9 @@ def effective_session_reasoning_effort(session_effort, profile_home) -> str:
     """
     if session_effort is not None:
         return str(session_effort)
-    cfg = get_config_for_profile_home(profile_home, isolate_config_override=True)
-    agent_cfg = cfg.get("agent") if isinstance(cfg, dict) else None
-    if not isinstance(agent_cfg, dict):
-        return ""
-    return str(agent_cfg.get("reasoning_effort") or "").strip().lower()
+    return _config_reasoning_effort(
+        get_config_for_profile_home(profile_home, isolate_config_override=True)
+    )
 
 
 _REASONING_EFFORT_UNSET = object()
@@ -6209,6 +6213,21 @@ def set_reasoning_effort(
 
     Raises ``ValueError`` on any other unrecognised level so callers can 400.
     """
+    write_reasoning_effort(effort)
+    return get_reasoning_status(
+        model_id=model_id,
+        provider_id=provider_id,
+        base_url=base_url,
+    )
+
+
+def write_reasoning_effort(effort: str) -> str:
+    """Write ``agent.reasoning_effort`` to the active profile's config.yaml.
+
+    The local file write half of :func:`set_reasoning_effort`, without the
+    capability lookup (which may do network I/O), so callers can hold a
+    session lock across it. Returns the normalized stored value.
+    """
     raw = normalize_reasoning_effort(effort)
     config_path = _get_config_path()
     with _cfg_lock:
@@ -6227,11 +6246,7 @@ def set_reasoning_effort(
         config_data["agent"] = agent_cfg
         _save_yaml_config_file(config_path, config_data)
     reload_config()
-    return get_reasoning_status(
-        model_id=model_id,
-        provider_id=provider_id,
-        base_url=base_url,
-    )
+    return raw
 
 
 def _public_advanced_model_options(model_cfg: dict) -> dict:

@@ -163,7 +163,7 @@ def _post_reasoning(body, session, *, save_error=None, visible=True, config_erro
         )
         return False
 
-    session.save = save
+    session.save = lambda touch_updated_at=True: save()
     handler = _DummyHandler(body, command="POST")
     with (
         patch(
@@ -173,12 +173,19 @@ def _post_reasoning(body, session, *, save_error=None, visible=True, config_erro
         patch("api.routes._get_or_materialize_session", return_value=session),
         patch("api.routes._get_session_agent_lock", return_value=_MutationLock()),
         patch(
-            "api.routes.set_reasoning_effort",
-            side_effect=lambda effort, **_kw: (
+            "api.routes.write_reasoning_effort",
+            side_effect=lambda effort: (
                 events.append("config"),
                 (_ for _ in ()).throw(config_error) if config_error else None,
-                {"reasoning_effort": effort, "supported_efforts": ["low", "high"]},
+                effort,
             )[2],
+        ),
+        patch(
+            "api.routes.get_reasoning_status",
+            side_effect=lambda **_kw: (
+                events.append("status"),
+                {"reasoning_effort": "low", "supported_efforts": ["low", "high"]},
+            )[1],
         ),
         patch("api.config._evict_session_agent") as evict,
     ):
@@ -197,10 +204,11 @@ def test_reasoning_post_saves_session_before_profile_default_without_eviction():
     )
 
     assert handler.status == 200
-    assert handler.payload()["reasoning_effort"] == "LOW"
+    assert handler.payload()["reasoning_effort"] == "low"
     assert session.reasoning_effort == "low"
-    # Session and profile writes form one serialized step per session.
-    assert events == ["lock-enter", "save", "config", "lock-exit"]
+    # Session and profile writes form one serialized step per session; the
+    # capability lookup (possible network I/O) runs after the lock is released.
+    assert events == ["lock-enter", "save", "config", "lock-exit", "status"]
     # reasoning_config is part of the agent cache signature, so the next turn
     # rebuilds the agent without a synchronous lifecycle commit here.
     evict.assert_not_called()
@@ -230,7 +238,7 @@ def test_reasoning_post_failed_real_save_keeps_live_equal_to_reloaded(
     handler = _DummyHandler({"effort": "low", "session_id": "atomic-save"}, command="POST")
     with (
         patch("api.models._safe_replace", side_effect=OSError("disk full")),
-        patch("api.routes.set_reasoning_effort") as set_effort,
+        patch("api.routes.write_reasoning_effort") as set_effort,
         patch("api.routes._session_id_visible_to_request_profile", return_value=True),
     ):
         try:
@@ -250,6 +258,50 @@ def test_reasoning_post_failed_profile_write_restores_session():
     )
     assert events == ["lock-enter", "save", "config", "save", "lock-exit", "OSError"]
     assert session.reasoning_effort == "high"
+
+
+def test_reasoning_post_read_only_session_keeps_master_profile_save():
+    events = []
+    handler = _DummyHandler({"effort": "low", "session_id": "readonly"}, command="POST")
+    with (
+        patch("api.routes._session_id_visible_to_request_profile", return_value=True),
+        patch(
+            "api.routes._get_or_materialize_session",
+            side_effect=PermissionError("read-only imported session"),
+        ),
+        patch("api.routes.write_reasoning_effort", side_effect=lambda e: events.append(e)),
+        patch("api.routes.get_reasoning_status", return_value={"reasoning_effort": "low"}),
+    ):
+        handle_post(handler, urlparse("/api/reasoning"))
+    assert handler.status == 200
+    assert events == ["low"]
+
+
+def test_reasoning_post_failed_rollback_save_surfaces_profile_error():
+    session = SimpleNamespace(reasoning_effort="high")
+    saves = []
+
+    def save(touch_updated_at=True):
+        saves.append(touch_updated_at)
+        if len(saves) == 2:
+            raise OSError("rollback failed")
+
+    session.save = save
+    handler = _DummyHandler({"effort": "low", "session_id": "session-b"}, command="POST")
+    raised = None
+    with (
+        patch("api.routes._session_id_visible_to_request_profile", return_value=True),
+        patch("api.routes._get_or_materialize_session", return_value=session),
+        patch("api.routes.write_reasoning_effort", side_effect=PermissionError("config ro")),
+    ):
+        try:
+            handle_post(handler, urlparse("/api/reasoning"))
+        except Exception as exc:
+            raised = exc
+    # The original profile-write error wins; memory matches the sidecar ("low").
+    assert isinstance(raised, PermissionError)
+    assert session.reasoning_effort == "low"
+    assert saves == [False, False]
 
 
 def test_reasoning_post_rejects_session_outside_active_profile():
@@ -279,7 +331,7 @@ def test_reasoning_post_does_not_mutate_profile_for_unknown_session():
     )
     with (
         patch("api.routes._get_or_materialize_session", side_effect=KeyError),
-        patch("api.routes.set_reasoning_effort") as set_effort,
+        patch("api.routes.write_reasoning_effort") as set_effort,
     ):
         handle_post(handler, urlparse("/api/reasoning"))
 
@@ -295,10 +347,9 @@ def test_runtime_paths_prefer_session_reasoning_effort():
     # _session_meta is pre-bound so a missing sidecar cannot NameError into
     # dropping the profile effort; legacy sessions read the isolated config.
     assert "            _session_meta = None\n" in streaming
-    # The live session wins over the sidecar, matching the Gateway worker.
-    live = streaming.index("_session_effort = getattr(s, 'reasoning_effort', None)")
-    sidecar = streaming.index("_session_effort = getattr(_session_meta, 'reasoning_effort', None)")
-    assert live < sidecar
+    # The live session is the source, matching the Gateway worker.
+    assert "_session_effort = getattr(s, 'reasoning_effort', None)" in streaming
+    assert "getattr(_session_meta, 'reasoning_effort'" not in streaming
     assert "effective_session_reasoning_effort(\n                        _session_effort, _profile_home," in streaming
     assert "resolve_session_reasoning_effort(" in gateway
     assert 'session_effort=getattr(s, "reasoning_effort", None)' in gateway
@@ -744,13 +795,13 @@ def test_overlapping_reasoning_posts_for_one_session_do_not_interleave(
     release_low = threading.Event()
     order = []
 
-    def fake_profile_write(effort, **_kw):
+    def fake_profile_write(effort):
         if effort == "low":
             low_in_config.set()
             assert release_low.wait(5)
         order.append(effort)
         profile_value["effort"] = effort
-        return {"reasoning_effort": effort}
+        return effort
 
     def post(effort):
         handler = _DummyHandler({"effort": effort, "session_id": "overlap"}, command="POST")
@@ -758,7 +809,8 @@ def test_overlapping_reasoning_posts_for_one_session_do_not_interleave(
         assert handler.status == 200
 
     with (
-        patch("api.routes.set_reasoning_effort", side_effect=fake_profile_write),
+        patch("api.routes.write_reasoning_effort", side_effect=fake_profile_write),
+        patch("api.routes.get_reasoning_status", return_value={"reasoning_effort": ""}),
         patch("api.routes._session_id_visible_to_request_profile", return_value=True),
     ):
         low = threading.Thread(target=post, args=("low",))
