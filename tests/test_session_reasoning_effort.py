@@ -873,17 +873,21 @@ def test_root_ignores_override_under_symlinked_profiles_dir(tmp_path, monkeypatc
 
 
 def test_non_isolated_symlinked_config_file_still_matches_its_home(tmp_path, monkeypatch):
+    """`work/config.yaml` is a dotfiles symlink named by HERMES_CONFIG_PATH; root active."""
     dotfiles = tmp_path / "dotfiles"
     dotfiles.mkdir()
     (dotfiles / "hermes.yaml").write_text("agent:\n  reasoning_effort: high\n")
     root = tmp_path / "root"
-    root.mkdir()
-    (root / "config.yaml").symlink_to(dotfiles / "hermes.yaml")
+    work = root / "profiles" / "work"
+    work.mkdir(parents=True)
+    (work / "config.yaml").symlink_to(dotfiles / "hermes.yaml")
     monkeypatch.setattr(profiles, "_DEFAULT_HERMES_HOME", root)
     monkeypatch.setattr(profiles, "_active_profile", "default")
     monkeypatch.setattr(profiles._tls, "profile", None, raising=False)
-    monkeypatch.setenv("HERMES_CONFIG_PATH", str(root / "config.yaml"))
+    monkeypatch.setenv("HERMES_CONFIG_PATH", str(work / "config.yaml"))
     config.reload_config()
     sentinel = {"agent": {"reasoning_effort": "from-get-config"}}
+    # Master: the config's parent directory is `work`, so the ambient
+    # get_config() (with its in-memory overrides) is used.
     with patch("api.config.get_config", return_value=sentinel):
-        assert config.get_config_for_profile_home(root) is sentinel
+        assert config.get_config_for_profile_home(work) is sentinel
