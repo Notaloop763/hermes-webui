@@ -2954,6 +2954,7 @@ from api.config import (
     model_with_provider_context,
     get_reasoning_status,
     set_reasoning_display,
+    set_reasoning_effort,
     write_reasoning_effort,
     normalize_reasoning_effort,
     effective_session_reasoning_effort,
@@ -16269,13 +16270,6 @@ def handle_post(handler, parsed) -> bool:
                 session_id = str(body.get("session_id") or "").strip() or None
                 normalized_effort = normalize_reasoning_effort(effort)
 
-                def _reasoning_status():
-                    return get_reasoning_status(
-                        model_id=model_id,
-                        provider_id=provider_id,
-                        base_url=base_url,
-                    )
-
                 reasoning_session = None
                 if session_id:
                     # Profile visibility for body session_id is enforced by
@@ -16289,8 +16283,15 @@ def handle_post(handler, parsed) -> bool:
                         # effort; keep master's profile-default-only save.
                         reasoning_session = None
                 if reasoning_session is None:
-                    write_reasoning_effort(effort)
-                    return j(handler, _reasoning_status())
+                    return j(
+                        handler,
+                        set_reasoning_effort(
+                            effort,
+                            model_id=model_id,
+                            provider_id=provider_id,
+                            base_url=base_url,
+                        ),
+                    )
                 # One serialized step per session: overlapping POSTs for the same
                 # chat cannot interleave their session and profile writes. Only
                 # local file writes run under the lock; the capability lookup
@@ -16324,7 +16325,17 @@ def handle_post(handler, parsed) -> bool:
                                 session_id, exc_info=True,
                             )
                         raise
-                return j(handler, _reasoning_status())
+                # Report this session's stored value, not the shared profile
+                # default another chat may have rewritten since the lock was released.
+                return j(
+                    handler,
+                    get_reasoning_status(
+                        model_id=model_id,
+                        provider_id=provider_id,
+                        base_url=base_url,
+                        effort_override=normalized_effort,
+                    ),
+                )
             return bad(handler, "reasoning: must supply 'display' or 'effort'")
         except ValueError as e:
             return bad(handler, str(e))

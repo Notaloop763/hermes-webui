@@ -781,7 +781,7 @@ def get_config_for_profile_home(
         if (
             isolate_config_override and override_path is not None
             and target == root_home
-            and not override_path.is_relative_to(root_home / "profiles")
+            and not override_path.is_relative_to(_cfg_safe_resolve(root_home / "profiles"))
         ):
             return get_config()
         # Root is handled above; an override under <root>/profiles belongs to
@@ -802,10 +802,12 @@ def get_config_for_profile_home(
     # whose directory doesn't physically exist yet (fresh install, monkeypatched
     # cfg) must still resolve through get_config(), not return {} (#4516 gate).
     try:
-        config_path = _cfg_safe_resolve(_get_config_path())
-        if config_path.parent == target or (
+        # Resolve the parent directory, not the file, so a symlinked config.yaml
+        # still matches its own home (master's comparison).
+        config_parent = _cfg_safe_resolve(_get_config_path().parent)
+        if config_parent == target or (
             isolate_config_override and target != root_home
-            and config_path.is_relative_to(target)
+            and config_parent.is_relative_to(target)
         ):
             return get_config()
     except Exception:

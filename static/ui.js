@@ -5478,9 +5478,9 @@ function _saveReasoningEffort(effort){
 }
 
 function _failReasoningSave(saveSeq){
-  // The newest save failed, so the chip may show an older save's value. Drop
-  // the cache so the next sync re-reads what the server actually stored.
-  if(saveSeq===_reasoningSaveSeq) _lastReasoningFetchKey=null;
+  // The newest save failed, so an older save (whose result was suppressed)
+  // may be what the server stored. Re-read it now rather than on a later sync.
+  if(saveSeq===_reasoningSaveSeq) fetchReasoningChip();
 }
 
 function _applyReasoningSaveResult(saveSeq, context, profile, effort, status){

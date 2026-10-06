@@ -63,6 +63,7 @@ function pick(effort) {
   let oldGet;
   if(change==='old_get') { run('fetchReasoningChip()'); oldGet=requests.at(-1); }
   let serialized = null;
+  let immediateReread = false;
   if(change==='newer_save'||change==='newer_save_failed') {
     // A newer pick in the same chat must not reach the server until the older
     // save settles, so the server cannot store the older pick last.
@@ -87,7 +88,13 @@ function pick(effort) {
     if(second===post) throw new Error('newer save never dispatched');
     if(JSON.parse(second.options.body).effort!=='low') throw new Error('wrong newer save');
     if(change==='newer_save') second.ok(status('low'));
-    else second.fail(new Error('boom'));
+    else {
+      second.fail(new Error('boom')); await flush();
+      // The failed newest save re-reads the stored value immediately.
+      const reread = requests.at(-1);
+      immediateReread = !reread.options && reread!==second;
+      reread.ok(status('high'));
+    }
     await flush();
   }
   if(oldGet) { oldGet.ok(status('low')); await flush(); }
@@ -102,7 +109,7 @@ function pick(effort) {
     run("S.session.session_id='A';syncReasoningChip()");
     requests.at(-1).ok(status('high')); await flush();
   }
-  process.stdout.write(JSON.stringify({afterSave,afterSync,serialized,refetched,resynced,
+  process.stdout.write(JSON.stringify({afterSave,afterSync,serialized,refetched,resynced,immediateReread,
     mobile:els.composerMobileReasoningLabel.textContent,
     restored:els.composerReasoningLabel.textContent}));
 })().catch(e=>{console.error(e); process.exit(1);});
@@ -134,7 +141,9 @@ def test_delayed_save_keeps_its_context(tmp_path, entry, change):
     if change == "newer_save_failed":
         # The older save's late response must not claim the chip; the failed
         # newest save drops the cache so the next sync reads the stored value.
-        assert out["refetched"] is True
+        assert out["immediateReread"] is True
+        assert out["afterSave"] == "High"
+        assert out["refetched"] is False
         assert out["afterSync"] == "High"
         return
     if change in ("model", "provider"):
