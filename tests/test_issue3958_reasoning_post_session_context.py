@@ -70,6 +70,7 @@ def test_reasoning_post_route_threads_model_context():
     body = match.group(1)
     assert 'body.get("model")' in body
     assert 'body.get("provider")' in body
-    assert 'set_reasoning_effort(' in body
+    assert 'write_reasoning_effort(' in body
+    assert 'get_reasoning_status(' in body
     assert "model_id=model_id" in body
     assert "provider_id=provider_id" in body
