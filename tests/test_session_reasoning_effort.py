@@ -140,7 +140,7 @@ def test_reasoning_get_rejects_session_outside_active_profile():
     status.assert_not_called()
 
 
-def _post_reasoning(body, session, *, save_error=None, visible=True):
+def _post_reasoning(body, session, *, save_error=None, visible=True, config_error=None):
     events = []
 
     class _MutationLock:
@@ -176,8 +176,9 @@ def _post_reasoning(body, session, *, save_error=None, visible=True):
             "api.routes.set_reasoning_effort",
             side_effect=lambda effort, **_kw: (
                 events.append("config"),
+                (_ for _ in ()).throw(config_error) if config_error else None,
                 {"reasoning_effort": effort, "supported_efforts": ["low", "high"]},
-            )[1],
+            )[2],
         ),
         patch("api.config._evict_session_agent") as evict,
     ):
@@ -198,7 +199,8 @@ def test_reasoning_post_saves_session_before_profile_default_without_eviction():
     assert handler.status == 200
     assert handler.payload()["reasoning_effort"] == "LOW"
     assert session.reasoning_effort == "low"
-    assert events == ["lock-enter", "save", "lock-exit", "config"]
+    # Session and profile writes form one serialized step per session.
+    assert events == ["lock-enter", "save", "config", "lock-exit"]
     # reasoning_config is part of the agent cache signature, so the next turn
     # rebuilds the agent without a synchronous lifecycle commit here.
     evict.assert_not_called()
@@ -238,6 +240,16 @@ def test_reasoning_post_failed_real_save_keeps_live_equal_to_reloaded(
     set_effort.assert_not_called()
     assert session.reasoning_effort == "high"
     assert Session.load("atomic-save").reasoning_effort == "high"
+
+
+def test_reasoning_post_failed_profile_write_restores_session():
+    session = SimpleNamespace(reasoning_effort="high")
+    _handler, events, _evict = _post_reasoning(
+        {"effort": "low", "session_id": "session-b"}, session,
+        config_error=OSError("read-only config"),
+    )
+    assert events == ["lock-enter", "save", "config", "save", "lock-exit", "OSError"]
+    assert session.reasoning_effort == "high"
 
 
 def test_reasoning_post_rejects_session_outside_active_profile():
@@ -712,3 +724,57 @@ def test_root_new_session_model_ignores_override_under_named_profile(
     model, _provider = models._profile_default_model_state("default")
     assert model == "gpt-5.5"
     assert models._profile_default_reasoning_effort("default") == "low"
+
+
+def test_overlapping_reasoning_posts_for_one_session_do_not_interleave(
+    isolated_reasoning_profiles, tmp_path
+):
+    """`low` pauses after its session save; `high` must wait for the whole step."""
+    import threading
+
+    session = Session(
+        session_id="overlap", profile="default", model="gpt-5",
+        model_provider="openai", workspace=str(tmp_path), reasoning_effort="medium",
+        messages=[{"role": "user", "content": "hi"}],
+    )
+    session.save(touch_updated_at=False)
+    models.SESSIONS[session.session_id] = session
+    profile_value = {}
+    low_in_config = threading.Event()
+    release_low = threading.Event()
+    order = []
+
+    def fake_profile_write(effort, **_kw):
+        if effort == "low":
+            low_in_config.set()
+            assert release_low.wait(5)
+        order.append(effort)
+        profile_value["effort"] = effort
+        return {"reasoning_effort": effort}
+
+    def post(effort):
+        handler = _DummyHandler({"effort": effort, "session_id": "overlap"}, command="POST")
+        handle_post(handler, urlparse("/api/reasoning"))
+        assert handler.status == 200
+
+    with (
+        patch("api.routes.set_reasoning_effort", side_effect=fake_profile_write),
+        patch("api.routes._session_id_visible_to_request_profile", return_value=True),
+    ):
+        low = threading.Thread(target=post, args=("low",))
+        low.start()
+        assert low_in_config.wait(5)
+        high = threading.Thread(target=post, args=("high",))
+        high.start()
+        high.join(0.3)
+        # `high` is blocked on the session lock, not writing between `low`'s steps.
+        assert high.is_alive()
+        assert session.reasoning_effort == "low"
+        release_low.set()
+        low.join(5)
+        high.join(5)
+
+    assert order == ["low", "high"]
+    assert profile_value["effort"] == "high"
+    assert session.reasoning_effort == "high"
+    assert Session.load("overlap").reasoning_effort == "high"
