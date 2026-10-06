@@ -5451,17 +5451,39 @@ function _reasoningEffortQuery(){
   return qs?('?'+qs):'';
 }
 
-// Monotonic save counter: only the most recently dispatched effort save may
-// update the chip, so an older save resolving late cannot undo a newer pick.
+// Monotonic save counter plus the newest save per profile/session: only the
+// newest save for a chat may update that chat's chip, so an older save resolving
+// late cannot undo a newer pick, and another chat's pick cannot hide this one's.
 let _reasoningSaveSeq=0;
+const _reasoningLatestSaveByOwner=new Map();
 // Effort saves are sent one at a time in pick order, so the threaded server
 // stores the latest pick rather than whichever request it handled last.
 let _reasoningSaveChain=Promise.resolve();
+// Every request carries the profile cookie at send time. A profile switch
+// freezes new picks and drains queued saves before it changes the cookie, so a
+// save queued behind a slow one still lands in the profile it was picked in.
+let _reasoningSavesFrozen=0;
+
+function _reasoningSaveOwner(profile, context){
+  return profile+'\n'+((context&&context.session_id)||'');
+}
+
+async function _beginReasoningProfileSwitch(){
+  ++_reasoningSavesFrozen;
+  await _reasoningSaveChain;
+}
+
+function _endReasoningProfileSwitch(){
+  if(_reasoningSavesFrozen>0) --_reasoningSavesFrozen;
+}
 
 function _saveReasoningEffort(effort){
+  if(_reasoningSavesFrozen) return Promise.reject(new Error('profile switch in progress'));
   const context=_reasoningEffortContext();
   const profile=(S&&S.activeProfile)||'default';
+  const owner=_reasoningSaveOwner(profile, context);
   const saveSeq=++_reasoningSaveSeq;
+  _reasoningLatestSaveByOwner.set(owner, saveSeq);
   const payload=Object.assign({effort:effort},context);
   const post=function(){
     return api('/api/reasoning',{method:'POST',body:JSON.stringify(payload)});
@@ -5469,24 +5491,31 @@ function _saveReasoningEffort(effort){
   const request=_reasoningSaveChain.then(post,post);
   _reasoningSaveChain=request.catch(function(){});
   return request.then(function(st){
-    _applyReasoningSaveResult(saveSeq, context, profile, (st&&st.reasoning_effort)||effort, st||{});
+    _applyReasoningSaveResult(saveSeq, owner, context, profile, (st&&st.reasoning_effort)||effort, st||{});
     return st;
   },function(e){
-    _failReasoningSave(saveSeq);
+    _failReasoningSave(saveSeq, owner);
     throw e;
   });
 }
 
-function _failReasoningSave(saveSeq){
-  // The newest save failed, so an older save (whose result was suppressed)
-  // may be what the server stored. Re-read it now rather than on a later sync.
-  if(saveSeq===_reasoningSaveSeq) fetchReasoningChip();
+function _isLatestReasoningSave(saveSeq, owner){
+  return _reasoningLatestSaveByOwner.get(owner)===saveSeq;
 }
 
-function _applyReasoningSaveResult(saveSeq, context, profile, effort, status){
+function _failReasoningSave(saveSeq, owner){
+  // This chat's newest save failed, so an older save (whose result was
+  // suppressed) may be what the server stored. Re-read it now if it is visible.
+  if(!_isLatestReasoningSave(saveSeq, owner)) return;
+  _reasoningLatestSaveByOwner.delete(owner);
+  if(owner===_reasoningSaveOwner((S&&S.activeProfile)||'default', _reasoningEffortContext())) fetchReasoningChip();
+}
+
+function _applyReasoningSaveResult(saveSeq, owner, context, profile, effort, status){
   // The server saved the originating session. This single-entry UI cache
   // belongs only to the visible context; revisiting another session refetches.
-  if(saveSeq!==_reasoningSaveSeq) return;
+  if(!_isLatestReasoningSave(saveSeq, owner)) return;
+  _reasoningLatestSaveByOwner.delete(owner);
   if(profile!==((S&&S.activeProfile)||'default')) return;
   const params=new URLSearchParams(context).toString();
   const key=params?('?'+params):'';
