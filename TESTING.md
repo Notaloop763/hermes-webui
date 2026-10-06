@@ -388,7 +388,14 @@ profile's reasoning default when no stored override exists. An explicit session
 override wins over both the named and process/root profile values. With distinct
 root/named Gateway URLs and keys, the initial request's URL, Authorization header,
 and retained stream endpoint must all belong to the session's profile, matching
-the endpoint used for reattachment, Stop, and approval replies.
+the endpoint used for reattachment, Stop, and approval replies while the stream
+holds it. (Once that entry is cleaned up, Stop and approval fall back to the
+ambient endpoint, as on master.)
+
+Same-chat ordering is covered by `tests/test_reasoning_effort_save_race.py` too:
+pick High then Low in one chat with the first save delayed. Low must not be sent
+until High settles, and the chip must end on Low. If the newest save fails, the
+chip must re-read the stored value.
 
 Delayed-save regressions are covered by `tests/test_reasoning_effort_save_race.py`.
 With a throttled connection, change A's effort through the dropdown or
