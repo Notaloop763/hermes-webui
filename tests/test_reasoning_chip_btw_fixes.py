@@ -10,7 +10,7 @@ Four invariants this file locks in place:
    of the `🧠` emoji, matching every other composer chip.
 
 3. `cmdReasoning()` applies the server-confirmed effort through
-   `_applyReasoningSaveResult()`, not `syncReasoningChip()` which re-applies
+   `_saveReasoningEffort()`, not `syncReasoningChip()` which re-applies
    the stale cached value.
 
 4. `attachBtwStream()` sets a `_streamDone` flag in `done`/`apperror` and
@@ -185,7 +185,7 @@ class TestReasoningCommandUpdatesChip:
         )
         assert m, "cmdReasoning not found in commands.js"
         fn = m.group(0)
-        assert "_applyReasoningSaveResult(saveSeq, context, profile, eff," in fn, (
+        assert "_saveReasoningEffort(arg)" in fn, (
             "cmdReasoning must apply the server-confirmed effort from the "
             "/api/reasoning POST response"
         )
