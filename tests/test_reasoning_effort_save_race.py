@@ -161,3 +161,126 @@ def test_delayed_save_keeps_its_context(tmp_path, entry, change):
     restored = "High" if change == "session" else expected
     assert out["restored"] == restored
     assert out["mobile"] == restored
+
+
+CROSS_DRIVER = r"""
+const fs = require('fs');
+const vm = require('vm');
+const root = process.argv[2];
+const [entry, change] = JSON.parse(process.argv[3]);
+function el() {
+  return {style:{}, dataset:{}, textContent:'', value:'',
+    classList:{toggle(){},remove(){},add(){},contains(){return false}},
+    setAttribute(){}, querySelectorAll(){return []}};
+}
+const els = Object.fromEntries(['modelSelect','composerReasoningWrap',
+  'composerReasoningLabel','composerReasoningChip','composerReasoningDropdown',
+  'composerMobileReasoningLabel','composerMobileReasoningAction'].map(k=>[k,el()]));
+const clicks = [];
+const requests = [];
+const context = vm.createContext({
+  S:{activeProfile:'default',session:{session_id:'A',model:'gpt-5',model_provider:'openai',profile:'default'}},
+  window:{}, URLSearchParams, Promise,
+  document:{addEventListener(type, fn){if(type==='click') clicks.push(fn);}},
+  $:id=>els[id]||null, showToast(){},
+  api(url, options){
+    const request = {url,options,profile:context.S.activeProfile}; requests.push(request);
+    return new Promise((ok, fail)=>{request.ok=ok; request.fail=fail;});
+  }
+});
+const ui = fs.readFileSync(root+'/static/ui.js','utf8');
+vm.runInContext(ui.slice(ui.indexOf('// ── Reasoning effort chip'),
+  ui.indexOf('// ── Session toolsets chip')),context);
+const commands = fs.readFileSync(root+'/static/commands.js','utf8');
+vm.runInContext(commands.slice(commands.indexOf('function cmdReasoning('),
+  commands.indexOf('function cmdVoice(')),context);
+const run = code=>vm.runInContext(code,context);
+const flush = ()=>new Promise(r=>setImmediate(r));
+const status = effort=>({reasoning_effort:effort,supported_efforts:['low','high']});
+const posts = ()=>requests.filter(r=>r.options?.method==='POST');
+function pick(effort) {
+  if(entry==='dropdown') {
+    const option={dataset:{effort}};
+    clicks[0]({target:{closest(selector){return selector==='.reasoning-option'?option:null;}}});
+  } else run(`cmdReasoning('${effort}')`);
+}
+
+(async()=>{
+  run('syncReasoningChip()'); requests.at(-1).ok(status('low')); await flush();
+  if(change==='profile_switch') {
+    pick('high'); await flush();
+    pick('low'); await flush();
+    const begun = run('_beginReasoningProfileSwitch()');
+    let drained = false; begun.then(()=>{drained=true;});
+    pick('high'); await flush();  // frozen: must not be queued under either cookie
+    posts()[0].ok(status('high')); await flush();
+    const drainedEarly = drained;
+    posts()[1].ok(status('low')); await flush();
+    const drainedAfter = drained;
+    run("S.activeProfile='work'; _endReasoningProfileSwitch()");
+    pick('high'); await flush();
+    process.stdout.write(JSON.stringify({
+      bodies: posts().map(r=>JSON.parse(r.options.body).effort),
+      profiles: posts().map(r=>r.profile), drainedEarly, drainedAfter}));
+    return;
+  }
+  // A picks High (delayed), B picks Low, return to A before either completes.
+  pick('high'); await flush();
+  const postA = posts().at(-1);
+  run("S.session={...S.session,session_id:'B'}; syncReasoningChip()");
+  requests.at(-1).ok(status('low')); await flush();
+  pick('low'); await flush();
+  run("S.session={...S.session,session_id:'A'}; syncReasoningChip()");
+  const getA = requests.at(-1);
+  if(change==='get_first') { getA.ok(status('low')); await flush(); }
+  postA.ok(status('high')); await flush();
+  const postB = posts().at(-1);
+  if(postB===postA) throw new Error('B save never dispatched');
+  postB.ok(status('low')); await flush();
+  if(change==='save_first') { getA.ok(status('low')); await flush(); }
+  const afterSave = els.composerReasoningLabel.textContent;
+  const before = requests.length;
+  run('syncReasoningChip()');
+  process.stdout.write(JSON.stringify({afterSave, refetched: requests.length>before,
+    afterSync: els.composerReasoningLabel.textContent}));
+})().catch(e=>{console.error(e); process.exit(1);});
+"""
+
+
+def _run_cross(tmp_path, entry, change):
+    driver = tmp_path / "cross.js"
+    driver.write_text(CROSS_DRIVER)
+    result = subprocess.run(
+        [NODE, str(driver), str(ROOT), json.dumps([entry, change])],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    return json.loads(result.stdout)
+
+
+@pytest.mark.parametrize("entry", ["dropdown", "command"])
+@pytest.mark.parametrize("change", ["get_first", "save_first"])
+def test_other_chats_pick_does_not_hide_returned_chats_save(tmp_path, entry, change):
+    out = _run_cross(tmp_path, entry, change)
+    assert out == {"afterSave": "High", "refetched": False, "afterSync": "High"}
+
+
+@pytest.mark.parametrize("entry", ["dropdown", "command"])
+def test_profile_switch_drains_queued_saves_under_old_profile(tmp_path, entry):
+    out = _run_cross(tmp_path, entry, "profile_switch")
+    # High and Low go out under the original profile before the switch proceeds;
+    # the pick made mid-switch is refused; a pick after the switch uses the new one.
+    assert out["bodies"] == ["high", "low", "high"]
+    assert out["profiles"] == ["default", "default", "work"]
+    assert out["drainedEarly"] is False
+    assert out["drainedAfter"] is True
+
+
+def test_both_profile_switch_paths_drain_reasoning_saves():
+    for rel, call in (("static/panels.js", "await api('/api/profile/switch', {"),
+                      ("static/sessions.js", "await api('/api/profile/switch',{")):
+        src = (ROOT / rel).read_text()
+        start = src.index(call)
+        begin = src.rindex("_beginReasoningProfileSwitch", 0, start)
+        assert start - begin < 600, rel
+        assert "_endReasoningProfileSwitch" in src[start:src.index("\n}\n", start)], rel
