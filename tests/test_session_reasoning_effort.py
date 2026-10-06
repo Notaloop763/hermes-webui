@@ -891,3 +891,22 @@ def test_non_isolated_symlinked_config_file_still_matches_its_home(tmp_path, mon
     # get_config() (with its in-memory overrides) is used.
     with patch("api.config.get_config", return_value=sentinel):
         assert config.get_config_for_profile_home(work) is sentinel
+
+
+def test_root_ignores_symlinked_override_file_under_named_profile(tmp_path, monkeypatch):
+    dotfiles = tmp_path / "dotfiles"
+    dotfiles.mkdir()
+    (dotfiles / "work.yaml").write_text("agent:\n  reasoning_effort: high\n")
+    root = tmp_path / "root"
+    work = root / "profiles" / "work"
+    work.mkdir(parents=True)
+    (root / "config.yaml").write_text("agent:\n  reasoning_effort: low\n")
+    (work / "config.yaml").symlink_to(dotfiles / "work.yaml")
+    monkeypatch.setattr(profiles, "_DEFAULT_HERMES_HOME", root)
+    monkeypatch.setattr(profiles, "_active_profile", "default")
+    monkeypatch.setattr(profiles._tls, "profile", None, raising=False)
+    monkeypatch.setenv("HERMES_CONFIG_PATH", str(work / "config.yaml"))
+    config.reload_config()
+    # The override is work's file even though it links outside <root>/profiles.
+    assert config.effective_session_reasoning_effort(None, root) == "low"
+    assert config.effective_session_reasoning_effort(None, work) == "high"
