@@ -16268,37 +16268,47 @@ def handle_post(handler, parsed) -> bool:
                 base_url = str(body.get("base_url") or "").strip() or None
                 session_id = str(body.get("session_id") or "").strip() or None
                 normalized_effort = normalize_reasoning_effort(effort)
-                if session_id:
-                    # Profile visibility for body session_id is enforced by
-                    # _guard_request_session_visibility before routing.
-                    try:
-                        reasoning_session = _get_or_materialize_session(session_id)
-                    except KeyError:
-                        return bad(handler, "Session not found", 404)
-                    except PermissionError:
-                        return bad(handler, "Read-only imported sessions cannot be updated from WebUI", 403)
-                    # Save the session before the profile default so a failed
-                    # session write never leaves only config.yaml changed. The
-                    # cached agent is rebuilt on its next turn because
-                    # reasoning_config is part of the agent cache signature.
-                    with _get_session_agent_lock(session_id):
-                        previous_effort = getattr(reasoning_session, "reasoning_effort", None)
-                        reasoning_session.reasoning_effort = normalized_effort
-                        try:
-                            reasoning_session.save()
-                        except Exception:
-                            # Keep the cached session equal to its sidecar.
-                            reasoning_session.reasoning_effort = previous_effort
-                            raise
-                return j(
-                    handler,
-                    set_reasoning_effort(
+
+                def _save_profile_default():
+                    return set_reasoning_effort(
                         effort,
                         model_id=model_id,
                         provider_id=provider_id,
                         base_url=base_url,
-                    ),
-                )
+                    )
+
+                if not session_id:
+                    return j(handler, _save_profile_default())
+                # Profile visibility for body session_id is enforced by
+                # _guard_request_session_visibility before routing.
+                try:
+                    reasoning_session = _get_or_materialize_session(session_id)
+                except KeyError:
+                    return bad(handler, "Session not found", 404)
+                except PermissionError:
+                    return bad(handler, "Read-only imported sessions cannot be updated from WebUI", 403)
+                # One serialized step per session: overlapping POSTs for the same
+                # chat cannot interleave their session and profile writes. The
+                # session is saved first so a failed save never changes only
+                # config.yaml; a failed profile write restores the session. The
+                # cached agent is rebuilt on its next turn because
+                # reasoning_config is part of the agent cache signature.
+                with _get_session_agent_lock(session_id):
+                    previous_effort = getattr(reasoning_session, "reasoning_effort", None)
+                    reasoning_session.reasoning_effort = normalized_effort
+                    try:
+                        reasoning_session.save()
+                    except Exception:
+                        # Keep the cached session equal to its sidecar.
+                        reasoning_session.reasoning_effort = previous_effort
+                        raise
+                    try:
+                        status = _save_profile_default()
+                    except Exception:
+                        reasoning_session.reasoning_effort = previous_effort
+                        reasoning_session.save()
+                        raise
+                return j(handler, status)
             return bad(handler, "reasoning: must supply 'display' or 'effort'")
         except ValueError as e:
             return bad(handler, str(e))
