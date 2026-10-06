@@ -269,12 +269,35 @@ def test_reasoning_post_read_only_session_keeps_master_profile_save():
             "api.routes._get_or_materialize_session",
             side_effect=PermissionError("read-only imported session"),
         ),
-        patch("api.routes.write_reasoning_effort", side_effect=lambda e: events.append(e)),
-        patch("api.routes.get_reasoning_status", return_value={"reasoning_effort": "low"}),
+        patch(
+            "api.routes.set_reasoning_effort",
+            side_effect=lambda e, **_kw: events.append(e) or {"reasoning_effort": e},
+        ),
     ):
         handle_post(handler, urlparse("/api/reasoning"))
     assert handler.status == 200
     assert events == ["low"]
+
+
+def test_reasoning_post_reports_this_sessions_effort_not_shared_default():
+    session = SimpleNamespace(reasoning_effort="high", save=lambda **_kw: None)
+    captured = {}
+
+    def status(**kwargs):
+        captured.update(kwargs)
+        # Another chat rewrote the shared profile default after our lock.
+        return {"reasoning_effort": kwargs.get("effort_override", "xhigh")}
+
+    handler = _DummyHandler({"effort": "low", "session_id": "session-a"}, command="POST")
+    with (
+        patch("api.routes._session_id_visible_to_request_profile", return_value=True),
+        patch("api.routes._get_or_materialize_session", return_value=session),
+        patch("api.routes.write_reasoning_effort"),
+        patch("api.routes.get_reasoning_status", side_effect=status),
+    ):
+        handle_post(handler, urlparse("/api/reasoning"))
+    assert handler.payload()["reasoning_effort"] == "low"
+    assert captured["effort_override"] == "low"
 
 
 def test_reasoning_post_failed_rollback_save_surfaces_profile_error():
@@ -830,3 +853,37 @@ def test_overlapping_reasoning_posts_for_one_session_do_not_interleave(
     assert profile_value["effort"] == "high"
     assert session.reasoning_effort == "high"
     assert Session.load("overlap").reasoning_effort == "high"
+
+
+def test_root_ignores_override_under_symlinked_profiles_dir(tmp_path, monkeypatch):
+    real_profiles = tmp_path / "data" / "profiles"
+    work = real_profiles / "work"
+    work.mkdir(parents=True)
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "profiles").symlink_to(real_profiles, target_is_directory=True)
+    (root / "config.yaml").write_text("agent:\n  reasoning_effort: low\n")
+    (work / "config.yaml").write_text("agent:\n  reasoning_effort: high\n")
+    monkeypatch.setattr(profiles, "_DEFAULT_HERMES_HOME", root)
+    monkeypatch.setattr(profiles, "_active_profile", "default")
+    monkeypatch.setattr(profiles._tls, "profile", None, raising=False)
+    monkeypatch.setenv("HERMES_CONFIG_PATH", str(root / "profiles" / "work" / "config.yaml"))
+    config.reload_config()
+    assert config.effective_session_reasoning_effort(None, root) == "low"
+
+
+def test_non_isolated_symlinked_config_file_still_matches_its_home(tmp_path, monkeypatch):
+    dotfiles = tmp_path / "dotfiles"
+    dotfiles.mkdir()
+    (dotfiles / "hermes.yaml").write_text("agent:\n  reasoning_effort: high\n")
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "config.yaml").symlink_to(dotfiles / "hermes.yaml")
+    monkeypatch.setattr(profiles, "_DEFAULT_HERMES_HOME", root)
+    monkeypatch.setattr(profiles, "_active_profile", "default")
+    monkeypatch.setattr(profiles._tls, "profile", None, raising=False)
+    monkeypatch.setenv("HERMES_CONFIG_PATH", str(root / "config.yaml"))
+    config.reload_config()
+    sentinel = {"agent": {"reasoning_effort": "from-get-config"}}
+    with patch("api.config.get_config", return_value=sentinel):
+        assert config.get_config_for_profile_home(root) is sentinel
