@@ -140,7 +140,7 @@ def test_reasoning_get_rejects_session_outside_active_profile():
     status.assert_not_called()
 
 
-def test_reasoning_post_persists_session_override_and_evicts_cached_agent():
+def _post_reasoning(body, session, *, save_error=None, visible=True):
     events = []
 
     class _MutationLock:
@@ -150,41 +150,88 @@ def test_reasoning_post_persists_session_override_and_evicts_cached_agent():
         def __exit__(self, *_exc):
             events.append("lock-exit")
 
-    session = SimpleNamespace(
-        reasoning_effort="high", save=lambda: events.append("save")
-    )
-    evicted = []
-    handler = _DummyHandler(
-        {
-            "effort": "low",
-            "model": "gpt-5",
-            "provider": "openai",
-            "session_id": "session-b",
-        },
-        command="POST",
-    )
+    def save():
+        events.append("save")
+        if save_error is not None:
+            raise save_error
+
+    def reject(other_handler, _session_id):
+        other_handler.send_response(409)
+        other_handler.end_headers()
+        other_handler.wfile.write(
+            json.dumps({"error": "Session belongs to a different profile"}).encode()
+        )
+        return False
+
+    session.save = save
+    handler = _DummyHandler(body, command="POST")
     with (
+        patch(
+            "api.routes._session_id_visible_to_request_profile",
+            side_effect=(lambda *_a, **_k: True) if visible else reject,
+        ),
         patch("api.routes._get_or_materialize_session", return_value=session),
         patch("api.routes._get_session_agent_lock", return_value=_MutationLock()),
         patch(
             "api.routes.set_reasoning_effort",
-            return_value={"reasoning_effort": "low", "supported_efforts": ["low", "high"]},
+            side_effect=lambda effort, **_kw: (
+                events.append("config"),
+                {"reasoning_effort": effort, "supported_efforts": ["low", "high"]},
+            )[1],
         ),
-        patch(
-            "api.config._evict_session_agent",
-            side_effect=lambda session_id: (
-                evicted.append(session_id),
-                events.append("evict"),
-            ),
-        ),
+        patch("api.config._evict_session_agent") as evict,
     ):
-        handle_post(handler, urlparse("/api/reasoning"))
+        try:
+            handle_post(handler, urlparse("/api/reasoning"))
+        except Exception as exc:  # surfaced as a 500 by the real server
+            events.append(type(exc).__name__)
+    return handler, events, evict
+
+
+def test_reasoning_post_saves_session_before_profile_default_without_eviction():
+    session = SimpleNamespace(reasoning_effort="high")
+    handler, events, evict = _post_reasoning(
+        {"effort": "LOW", "model": "gpt-5", "provider": "openai", "session_id": "session-b"},
+        session,
+    )
 
     assert handler.status == 200
-    assert handler.payload()["reasoning_effort"] == "low"
+    assert handler.payload()["reasoning_effort"] == "LOW"
     assert session.reasoning_effort == "low"
-    assert evicted == ["session-b"]
-    assert events == ["lock-enter", "save", "lock-exit", "evict"]
+    assert events == ["lock-enter", "save", "lock-exit", "config"]
+    # reasoning_config is part of the agent cache signature, so the next turn
+    # rebuilds the agent without a synchronous lifecycle commit here.
+    evict.assert_not_called()
+
+
+def test_reasoning_post_failed_session_save_leaves_profile_default_untouched():
+    session = SimpleNamespace(reasoning_effort="high")
+    _handler, events, _evict = _post_reasoning(
+        {"effort": "low", "session_id": "session-b"}, session, save_error=OSError("disk full"),
+    )
+    assert "config" not in events
+    assert events[-1] == "OSError"
+
+
+def test_reasoning_post_rejects_session_outside_active_profile():
+    # Enforced by the generic body session_id guard ahead of routing.
+    session = SimpleNamespace(reasoning_effort="high")
+    handler, events, _evict = _post_reasoning(
+        {"effort": "low", "session_id": "other-profile"}, session, visible=False,
+    )
+    assert handler.status == 409
+    assert events == []
+    assert session.reasoning_effort == "high"
+
+
+def test_reasoning_post_rejects_invalid_effort_before_session_write():
+    session = SimpleNamespace(reasoning_effort="high")
+    handler, events, _evict = _post_reasoning(
+        {"effort": "turbo", "session_id": "session-b"}, session,
+    )
+    assert handler.status == 400
+    assert events == []
+    assert session.reasoning_effort == "high"
 
 
 def test_reasoning_post_does_not_mutate_profile_for_unknown_session():
@@ -206,7 +253,12 @@ def test_runtime_paths_prefer_session_reasoning_effort():
     streaming = (REPO / "api" / "streaming.py").read_text(encoding="utf-8")
     gateway = (REPO / "api" / "gateway_chat.py").read_text(encoding="utf-8")
     assert "resolve_session_reasoning_effort(" in streaming
-    assert "session_effort=getattr(_session_meta, 'reasoning_effort', None)" in streaming
+    # _session_meta is pre-bound so a missing sidecar cannot NameError into
+    # dropping the profile effort; legacy sessions read the isolated config.
+    assert "            _session_meta = None\n" in streaming
+    assert "_session_effort = getattr(_session_meta, 'reasoning_effort', None)" in streaming
+    assert "_session_effort = getattr(s, 'reasoning_effort', None)" in streaming
+    assert "_profile_home, isolate_config_override=True," in streaming
     assert "resolve_session_reasoning_effort(" in gateway
     assert 'session_effort=getattr(s, "reasoning_effort", None)' in gateway
 
@@ -457,10 +509,12 @@ def test_root_gateway_turn_honors_external_config_while_named_profile_active(
     assert payload["reasoning_effort"] == "xhigh"
 
 
+@pytest.mark.parametrize("active", ["work", "default"])
 def test_root_override_under_named_profile_is_not_root_config(
-    external_root_with_named_active, monkeypatch
+    external_root_with_named_active, monkeypatch, active
 ):
     root, work, _external = external_root_with_named_active
+    monkeypatch.setattr(profiles, "_active_profile", active)
     nested = work / "mounted" / "config.yaml"
     nested.parent.mkdir()
     nested.write_text("agent:\n  reasoning_effort: high\n")
