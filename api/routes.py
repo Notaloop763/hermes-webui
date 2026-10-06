@@ -16282,8 +16282,14 @@ def handle_post(handler, parsed) -> bool:
                     # cached agent is rebuilt on its next turn because
                     # reasoning_config is part of the agent cache signature.
                     with _get_session_agent_lock(session_id):
+                        previous_effort = getattr(reasoning_session, "reasoning_effort", None)
                         reasoning_session.reasoning_effort = normalized_effort
-                        reasoning_session.save()
+                        try:
+                            reasoning_session.save()
+                        except Exception:
+                            # Keep the cached session equal to its sidecar.
+                            reasoning_session.reasoning_effort = previous_effort
+                            raise
                 return j(
                     handler,
                     set_reasoning_effort(

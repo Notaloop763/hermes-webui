@@ -211,6 +211,33 @@ def test_reasoning_post_failed_session_save_leaves_profile_default_untouched():
     )
     assert "config" not in events
     assert events[-1] == "OSError"
+    # The live session is rolled back so it still matches its sidecar.
+    assert session.reasoning_effort == "high"
+
+
+def test_reasoning_post_failed_real_save_keeps_live_equal_to_reloaded(
+    isolated_reasoning_profiles, tmp_path
+):
+    session = Session(
+        session_id="atomic-save", profile="default", model="gpt-5",
+        model_provider="openai", workspace=str(tmp_path), reasoning_effort="high",
+        messages=[{"role": "user", "content": "hi"}],
+    )
+    session.save(touch_updated_at=False)
+    models.SESSIONS[session.session_id] = session
+    handler = _DummyHandler({"effort": "low", "session_id": "atomic-save"}, command="POST")
+    with (
+        patch("api.models._safe_replace", side_effect=OSError("disk full")),
+        patch("api.routes.set_reasoning_effort") as set_effort,
+        patch("api.routes._session_id_visible_to_request_profile", return_value=True),
+    ):
+        try:
+            handle_post(handler, urlparse("/api/reasoning"))
+        except OSError:
+            pass
+    set_effort.assert_not_called()
+    assert session.reasoning_effort == "high"
+    assert Session.load("atomic-save").reasoning_effort == "high"
 
 
 def test_reasoning_post_rejects_session_outside_active_profile():
@@ -615,13 +642,14 @@ def test_effective_session_effort_shares_one_legacy_source(
         assert models._profile_default_reasoning_effort("work") == "high"
 
 
+@pytest.mark.parametrize("parent_effort", ["high", "none", "", None])
 @pytest.mark.parametrize("route", ["btw", "background"])
 def test_btw_and_background_children_inherit_parent_effort(
-    isolated_reasoning_profiles, tmp_path, route
+    isolated_reasoning_profiles, tmp_path, route, parent_effort
 ):
     parent = Session(
         session_id=f"parent-{route}", profile="default", model="gpt-5",
-        model_provider="openai", workspace=str(tmp_path), reasoning_effort="high",
+        model_provider="openai", workspace=str(tmp_path), reasoning_effort=parent_effort,
     )
     models.SESSIONS[parent.session_id] = parent
     created = []
@@ -643,5 +671,44 @@ def test_btw_and_background_children_inherit_parent_effort(
         handle_post(handler, urlparse(f"/api/{route}"))
 
     assert created, handler.status
-    # Profile default is "low"; the child must follow the parent's "high".
-    assert created[0].reasoning_effort == "high"
+    # Profile default is "low"; the child keeps the parent's raw value,
+    # including None (legacy) and "" (provider default).
+    assert created[0].reasoning_effort == parent_effort
+
+
+@pytest.mark.parametrize("config_location", ["root", "external", "unset"])
+def test_local_worker_legacy_session_uses_session_profile_config(
+    isolated_reasoning_profiles, tmp_path, monkeypatch, config_location
+):
+    """Local-transport twin of the legacy chip test, sticky active profile ``work``."""
+    _root, work = isolated_reasoning_profiles
+    if config_location == "external":
+        external = tmp_path / "external.yaml"
+        external.write_text("agent:\n  reasoning_effort: low\n")
+        monkeypatch.setenv("HERMES_CONFIG_PATH", str(external))
+    elif config_location == "unset":
+        monkeypatch.delenv("HERMES_CONFIG_PATH", raising=False)
+    monkeypatch.setattr(profiles, "_active_profile", "work")
+    config.reload_config()
+    # The streaming worker resolves a legacy (None) session through this helper
+    # with the session's profile home; it must match the chip GET.
+    profile_home = str(profiles.get_hermes_home_for_profile("work"))
+    effort = config.effective_session_reasoning_effort(None, profile_home)
+    assert effort == "high"
+    assert resolve_session_reasoning_effort(
+        config.get_config_for_profile_home(profile_home),
+        session_effort=effort, model_id="gpt-5", provider_id="openai",
+    ) == "high"
+
+
+def test_root_new_session_model_ignores_override_under_named_profile(
+    isolated_reasoning_profiles, monkeypatch
+):
+    root, work = isolated_reasoning_profiles
+    (root / "config.yaml").write_text("model:\n  default: gpt-5.5\nagent:\n  reasoning_effort: low\n")
+    (work / "config.yaml").write_text("model:\n  default: gpt-5\nagent:\n  reasoning_effort: high\n")
+    monkeypatch.setenv("HERMES_CONFIG_PATH", str(work / "config.yaml"))
+    config.reload_config()
+    model, _provider = models._profile_default_model_state("default")
+    assert model == "gpt-5.5"
+    assert models._profile_default_reasoning_effort("default") == "low"
