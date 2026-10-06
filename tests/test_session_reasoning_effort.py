@@ -910,3 +910,41 @@ def test_root_ignores_symlinked_override_file_under_named_profile(tmp_path, monk
     # The override is work's file even though it links outside <root>/profiles.
     assert config.effective_session_reasoning_effort(None, root) == "low"
     assert config.effective_session_reasoning_effort(None, work) == "high"
+
+
+@pytest.mark.parametrize(
+    "imported, expected",
+    [("ultra", None), ({"effort": "high"}, None), ("High", "high"), ("", ""), (None, None)],
+)
+def test_session_import_keeps_transcript_with_unknown_effort(imported, expected):
+    # An export from a CLI with a level this WebUI doesn't know must still import.
+    import api.routes as routes
+
+    captured = {}
+
+    class _FakeSession:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+            self.session_id = "imported"
+            self.messages = kwargs["messages"]
+
+        def save(self):
+            pass
+
+        def compact(self):
+            return {"session_id": self.session_id}
+
+    handler = _DummyHandler(command="POST")
+    body = {"messages": [], "workspace": "/tmp", "reasoning_effort": imported}
+    with (
+        patch("api.routes.Session", _FakeSession),
+        patch("api.routes.resolve_trusted_workspace", side_effect=lambda w: w),
+        patch("api.routes.SESSIONS", OrderedDict()),
+        patch("api.routes._evict_sessions_over_cap"),
+        patch("api.routes.publish_session_list_changed"),
+        patch("api.routes.public_session_projection", side_effect=lambda d: d),
+    ):
+        routes._handle_session_import(handler, body)
+
+    assert handler.status == 200
+    assert captured["reasoning_effort"] == expected
