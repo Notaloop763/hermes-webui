@@ -5717,15 +5717,11 @@ def _profile_default_reasoning_effort(profile=None):
     """Return the profile reasoning preference for a newly-created session."""
     try:
         from api.profiles import get_hermes_home_for_profile
-        config_data = _cfg.get_config_for_profile_home(
-            get_hermes_home_for_profile(profile), isolate_config_override=True,
+        return _cfg.effective_session_reasoning_effort(
+            None, get_hermes_home_for_profile(profile),
         )
     except Exception:
-        config_data = {}
-    agent_cfg = config_data.get("agent", {}) if isinstance(config_data, dict) else {}
-    if not isinstance(agent_cfg, dict) or "reasoning_effort" not in agent_cfg:
         return ""
-    return str(agent_cfg.get("reasoning_effort") or "").strip().lower()
 
 
 def new_session(workspace=None, model=None, profile=None, model_provider=None, project_id=None, worktree_info=None, enabled_toolsets=None):

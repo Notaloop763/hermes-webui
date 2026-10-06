@@ -27,12 +27,12 @@ const clicks = [];
 const requests = [];
 const context = vm.createContext({
   S:{activeProfile:'default',session:{session_id:'A',model:'gpt-5',model_provider:'openai',profile:'default'}},
-  window:{}, URLSearchParams,
+  window:{}, URLSearchParams, Promise,
   document:{addEventListener(type, fn){if(type==='click') clicks.push(fn);}},
   $:id=>els[id]||null, showToast(){},
   api(url, options){
     const request = {url,options}; requests.push(request);
-    return {then(fn){request.ok=fn;return {catch(fn){request.fail=fn;}};}};
+    return new Promise((ok, fail)=>{request.ok=ok; request.fail=fail;});
   }
 });
 const ui = fs.readFileSync(root+'/static/ui.js','utf8');
@@ -42,55 +42,65 @@ const commands = fs.readFileSync(root+'/static/commands.js','utf8');
 vm.runInContext(commands.slice(commands.indexOf('function cmdReasoning('),
   commands.indexOf('function cmdVoice(')),context);
 const run = code=>vm.runInContext(code,context);
+const flush = ()=>new Promise(r=>setImmediate(r));
 const status = effort=>({reasoning_effort:effort,supported_efforts:['low','high']});
-run('syncReasoningChip()'); requests.at(-1).ok(status('low'));
+const posts = ()=>requests.filter(r=>r.options?.method==='POST');
 function pick(effort) {
   if(entry==='dropdown') {
     const option={dataset:{effort}};
     clicks[0]({target:{closest(selector){return selector==='.reasoning-option'?option:null;}}});
   } else run(`cmdReasoning('${effort}')`);
-  return requests.filter(r=>r.options?.method==='POST').at(-1);
 }
-const post = pick('high');
-// A newer pick in the same chat resolves first; the older save lands last.
-if(change==='newer_save') pick('low').ok(status('low'));
-if(change==='newer_save_failed') {
-  pick('low').fail(new Error('boom'));
-}
-let oldGet;
-if(change==='old_get') {
-  run('fetchReasoningChip()'); oldGet=requests.at(-1);
-}
-if(!post) throw new Error('POST not dispatched');
-const payload = JSON.parse(post.options.body);
-if(payload.session_id!=='A'||payload.model!=='gpt-5'||payload.provider!=='openai')
-  throw new Error('wrong request owner');
-if(change==='session') run("S.session={...S.session,session_id:'B'}");
-if(change==='model') run("S.session.model='gpt-5.5'");
-if(change==='provider') run("S.session.model_provider='custom:test'");
-if(change==='profile') run("S.activeProfile='work'");
-if(change==='session'||change==='model'||change==='provider') {
-  run('syncReasoningChip()'); requests.at(-1).ok(status('low'));
-}
-post.ok(status('high'));
-if(oldGet) oldGet.ok(status('low'));
-const afterSave = els.composerReasoningLabel.textContent;
-const beforeSync = requests.length;
-run('syncReasoningChip()');
-if(change==='newer_save_failed') {
-  // The failed newest save must not leave a cached chip: resync reads the server.
-  if(requests.length!==beforeSync+1) throw new Error('no refetch after failed save');
-  requests.at(-1).ok(status('low'));
-}
-const afterSync = els.composerReasoningLabel.textContent;
-// Returning to A must read its persisted setting instead of borrowing B's cache.
-if(change==='session') {
-  run("S.session.session_id='A';syncReasoningChip()");
-  requests.at(-1).ok(status('high'));
-}
-process.stdout.write(JSON.stringify({afterSave,afterSync,
-  mobile:els.composerMobileReasoningLabel.textContent,
-  restored:els.composerReasoningLabel.textContent}));
+
+(async()=>{
+  run('syncReasoningChip()'); requests.at(-1).ok(status('low')); await flush();
+  pick('high'); await flush();
+  const post = posts().at(-1);
+  if(!post) throw new Error('POST not dispatched');
+  const payload = JSON.parse(post.options.body);
+  if(payload.session_id!=='A'||payload.model!=='gpt-5'||payload.provider!=='openai')
+    throw new Error('wrong request owner');
+  let oldGet;
+  if(change==='old_get') { run('fetchReasoningChip()'); oldGet=requests.at(-1); }
+  let serialized = null;
+  if(change==='newer_save'||change==='newer_save_failed') {
+    // A newer pick in the same chat must not reach the server until the older
+    // save settles, so the server cannot store the older pick last.
+    pick('low'); await flush();
+    serialized = posts().length===1;
+  }
+  if(change==='session') run("S.session={...S.session,session_id:'B'}");
+  if(change==='model') run("S.session.model='gpt-5.5'");
+  if(change==='provider') run("S.session.model_provider='custom:test'");
+  if(change==='profile') run("S.activeProfile='work'");
+  if(change==='session'||change==='model'||change==='provider') {
+    run('syncReasoningChip()'); requests.at(-1).ok(status('low')); await flush();
+  }
+  post.ok(status('high')); await flush();
+  if(serialized!==null) {
+    const second = posts().at(-1);
+    if(second===post) throw new Error('newer save never dispatched');
+    if(JSON.parse(second.options.body).effort!=='low') throw new Error('wrong newer save');
+    if(change==='newer_save') second.ok(status('low'));
+    else second.fail(new Error('boom'));
+    await flush();
+  }
+  if(oldGet) { oldGet.ok(status('low')); await flush(); }
+  const afterSave = els.composerReasoningLabel.textContent;
+  const beforeSync = requests.length;
+  run('syncReasoningChip()');
+  let refetched = requests.length>beforeSync;
+  if(refetched) { requests.at(-1).ok(status('high')); await flush(); }
+  const afterSync = els.composerReasoningLabel.textContent;
+  // Returning to A must read its persisted setting instead of borrowing B's cache.
+  if(change==='session') {
+    run("S.session.session_id='A';syncReasoningChip()");
+    requests.at(-1).ok(status('high')); await flush();
+  }
+  process.stdout.write(JSON.stringify({afterSave,afterSync,serialized,refetched,
+    mobile:els.composerMobileReasoningLabel.textContent,
+    restored:els.composerReasoningLabel.textContent}));
+})().catch(e=>{console.error(e); process.exit(1);});
 """
 
 
@@ -109,8 +119,22 @@ def test_delayed_save_keeps_its_context(tmp_path, entry, change):
     )
     assert result.returncode == 0, result.stderr
     out = json.loads(result.stdout)
+    if change in ("newer_save", "newer_save_failed"):
+        assert out["serialized"] is True
+    if change == "newer_save":
+        assert out["afterSave"] == "Low"
+        assert out["refetched"] is False
+        assert out["afterSync"] == "Low"
+        return
+    if change == "newer_save_failed":
+        # The older save's late response must not claim the chip; the failed
+        # newest save drops the cache so the next sync reads the stored value.
+        assert out["refetched"] is True
+        assert out["afterSync"] == "High"
+        return
     expected = "High" if change in ("unchanged", "old_get") else "Low"
     assert out["afterSave"] == expected
+    assert out["refetched"] is False
     assert out["afterSync"] == expected
     restored = "High" if change == "session" else expected
     assert out["restored"] == restored

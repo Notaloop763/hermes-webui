@@ -2956,6 +2956,7 @@ from api.config import (
     set_reasoning_display,
     set_reasoning_effort,
     normalize_reasoning_effort,
+    effective_session_reasoning_effort,
     create_stream_channel,
     get_config,
     get_webui_session_save_mode,
@@ -14503,27 +14504,22 @@ def handle_get(handler, parsed) -> bool:
         base_url = (query.get("base_url", [""])[0] or "").strip() or None
         session_id = (query.get("session_id", [""])[0] or "").strip() or None
         effort_kwargs = {}
+        # Profile visibility for session_id is enforced by
+        # _guard_request_session_visibility before routing. A session that
+        # cannot be loaded (deleted, failed external import) keeps master's
+        # profile-config answer instead of hiding the chip.
         if session_id:
-            if not _session_id_visible_to_request_profile(handler, session_id):
-                return True
             try:
                 reasoning_session = get_session(session_id, metadata_only=True)
             except KeyError:
-                return bad(handler, "Session not found", 404)
-            session_effort = getattr(reasoning_session, "reasoning_effort", None)
-            if session_effort is None:
-                # Legacy session: fall back to the session profile's config,
-                # the same source both backends resolve at run time.
+                reasoning_session = None
+            if reasoning_session is not None:
                 from api.profiles import get_hermes_home_for_profile
 
-                profile_cfg = get_config_for_profile_home(
+                effort_kwargs["effort_override"] = effective_session_reasoning_effort(
+                    getattr(reasoning_session, "reasoning_effort", None),
                     get_hermes_home_for_profile(getattr(reasoning_session, "profile", None)),
-                    isolate_config_override=True,
                 )
-                agent_cfg = profile_cfg.get("agent") if isinstance(profile_cfg, dict) else None
-                if isinstance(agent_cfg, dict):
-                    session_effort = agent_cfg.get("reasoning_effort")
-            effort_kwargs["effort_override"] = session_effort
         return j(
             handler,
             get_reasoning_status(
@@ -23196,6 +23192,8 @@ def _handle_btw(handler, body):
         model_provider=model_provider,
         profile=getattr(s, 'profile', None),
     )
+    # Inherit the parent's session-owned effort alongside its model.
+    ephemeral.reasoning_effort = getattr(s, 'reasoning_effort', None)
     # Copy conversation history for context (agent reads from messages)
     ephemeral.messages = list(s.messages or [])
     ephemeral.title = f"btw: {question[:60]}"
@@ -23249,6 +23247,7 @@ def _handle_background(handler, body):
         model_provider=model_provider,
         profile=getattr(s, 'profile', None),
     )
+    bg.reasoning_effort = getattr(s, 'reasoning_effort', None)
     bg.title = f"bg: {prompt[:60]}"
     bg.save()
     stream_id = uuid.uuid4().hex

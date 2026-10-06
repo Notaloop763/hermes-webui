@@ -57,6 +57,7 @@ from api.config import (
     load_settings,
     parse_reasoning_effort,
     resolve_session_reasoning_effort,
+    effective_session_reasoning_effort,
     _main_model_request_overrides,
     PROCESS_SESSION_INDEX, PROCESS_SESSION_INDEX_LOCK,
 )
@@ -11477,20 +11478,20 @@ def _run_agent_streaming(
             # without that metadata continue to inherit the profile/CLI value,
             # read from the same isolated session-profile config as the chip
             # and the Gateway worker (_cfg stays ambient-aware for toolsets).
+            # The live session `s` is what POST /api/reasoning mutates (and what
+            # the Gateway worker reads); the sidecar is only a fallback.
             try:
-                _session_effort = getattr(_session_meta, 'reasoning_effort', None)
+                _session_effort = getattr(s, 'reasoning_effort', None)
                 if _session_effort is None:
-                    _session_effort = getattr(s, 'reasoning_effort', None)
-                _effort_cfg = _cfg
-                if _session_effort is None:
-                    try:
-                        _effort_cfg = _get_config_for_home(
-                            _profile_home, isolate_config_override=True,
-                        )
-                    except Exception:
-                        logger.warning("isolated reasoning config read failed; using session config", exc_info=True)
+                    _session_effort = getattr(_session_meta, 'reasoning_effort', None)
+                try:
+                    _session_effort = effective_session_reasoning_effort(
+                        _session_effort, _profile_home,
+                    )
+                except Exception:
+                    logger.warning("isolated reasoning config read failed; using session config", exc_info=True)
                 _effort = resolve_session_reasoning_effort(
-                    _effort_cfg,
+                    _cfg,
                     session_effort=_session_effort,
                     model_id=resolved_model,
                     provider_id=resolved_provider,

@@ -5454,9 +5454,27 @@ function _reasoningEffortQuery(){
 // Monotonic save counter: only the most recently dispatched effort save may
 // update the chip, so an older save resolving late cannot undo a newer pick.
 let _reasoningSaveSeq=0;
+// Effort saves are sent one at a time in pick order, so the threaded server
+// stores the latest pick rather than whichever request it handled last.
+let _reasoningSaveChain=Promise.resolve();
 
-function _beginReasoningSave(){
-  return ++_reasoningSaveSeq;
+function _saveReasoningEffort(effort){
+  const context=_reasoningEffortContext();
+  const profile=(S&&S.activeProfile)||'default';
+  const saveSeq=++_reasoningSaveSeq;
+  const payload=Object.assign({effort:effort},context);
+  const post=function(){
+    return api('/api/reasoning',{method:'POST',body:JSON.stringify(payload)});
+  };
+  const request=_reasoningSaveChain.then(post,post);
+  _reasoningSaveChain=request.catch(function(){});
+  return request.then(function(st){
+    _applyReasoningSaveResult(saveSeq, context, profile, (st&&st.reasoning_effort)||effort, st||{});
+    return st;
+  },function(e){
+    _failReasoningSave(saveSeq);
+    throw e;
+  });
 }
 
 function _failReasoningSave(saveSeq){
@@ -5701,22 +5719,14 @@ document.addEventListener('click',function(e){
     // silently ignore the Default click and leave the toggle one-way off-only.
     // (#6219 round-3)
     if(opt){
-      const context=_reasoningEffortContext();
-      const profile=(S&&S.activeProfile)||'default';
-      const saveSeq=_beginReasoningSave();
-      const payload=Object.assign({effort:effort},context);
-      api('/api/reasoning',{method:'POST',body:JSON.stringify(payload)})
+      _saveReasoningEffort(effort)
         .then(function(st){
           // For Default (effort=''), the returned reasoning_effort is '' (clear)
           // — display 'Default' rather than an empty toast.
           const display=(st&&st.reasoning_effort)||effort||'Default';
-          _applyReasoningSaveResult(saveSeq, context, profile, (st&&st.reasoning_effort)||effort, st||{});
           showToast('🧠 Reasoning effort set to '+display);
         })
-        .catch(function(){
-          _failReasoningSave(saveSeq);
-          showToast('🧠 Failed to set effort');
-        });
+        .catch(function(){showToast('🧠 Failed to set effort');});
       closeReasoningDropdown();
     }
   }

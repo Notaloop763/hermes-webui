@@ -5984,6 +5984,23 @@ def resolve_session_reasoning_effort(
     )
 
 
+def effective_session_reasoning_effort(session_effort, profile_home) -> str:
+    """Return the stored effort a session's next turn starts from.
+
+    ``session_effort`` wins when present (``""`` = provider default). Legacy
+    sessions (``None``) inherit ``agent.reasoning_effort`` from their own
+    profile's isolated config: the single source shared by the composer chip,
+    new-session defaults, and the local and Gateway workers.
+    """
+    if session_effort is not None:
+        return str(session_effort)
+    cfg = get_config_for_profile_home(profile_home, isolate_config_override=True)
+    agent_cfg = cfg.get("agent") if isinstance(cfg, dict) else None
+    if not isinstance(agent_cfg, dict):
+        return ""
+    return str(agent_cfg.get("reasoning_effort") or "").strip().lower()
+
+
 _REASONING_EFFORT_UNSET = object()
 
 

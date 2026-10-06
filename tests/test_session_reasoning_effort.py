@@ -256,9 +256,11 @@ def test_runtime_paths_prefer_session_reasoning_effort():
     # _session_meta is pre-bound so a missing sidecar cannot NameError into
     # dropping the profile effort; legacy sessions read the isolated config.
     assert "            _session_meta = None\n" in streaming
-    assert "_session_effort = getattr(_session_meta, 'reasoning_effort', None)" in streaming
-    assert "_session_effort = getattr(s, 'reasoning_effort', None)" in streaming
-    assert "_profile_home, isolate_config_override=True," in streaming
+    # The live session wins over the sidecar, matching the Gateway worker.
+    live = streaming.index("_session_effort = getattr(s, 'reasoning_effort', None)")
+    sidecar = streaming.index("_session_effort = getattr(_session_meta, 'reasoning_effort', None)")
+    assert live < sidecar
+    assert "effective_session_reasoning_effort(\n                        _session_effort, _profile_home," in streaming
     assert "resolve_session_reasoning_effort(" in gateway
     assert 'session_effort=getattr(s, "reasoning_effort", None)' in gateway
 
@@ -268,7 +270,11 @@ def test_reasoning_slash_command_posts_active_session_context():
     start = commands.index("function cmdReasoning")
     end = commands.index("function cmdVoice", start)
     body = commands[start:end]
-    assert "_reasoningEffortContext()" in body
+    assert "_saveReasoningEffort(arg)" in body
+    ui = (REPO / "static" / "ui.js").read_text(encoding="utf-8")
+    helper = ui[ui.index("function _saveReasoningEffort("):]
+    helper = helper[:helper.index("\n}\n")]
+    assert "_reasoningEffortContext()" in helper
 
 
 @pytest.fixture
@@ -576,3 +582,66 @@ def test_reasoning_get_root_legacy_session_honors_external_config_while_named_ac
         )
     assert handler.status == 200
     assert handler.payload()["reasoning_effort"] == "xhigh"
+
+
+def test_reasoning_get_unloadable_session_keeps_profile_answer():
+    captured = {}
+
+    def status(**kwargs):
+        captured.update(kwargs)
+        return {"reasoning_effort": "high", "supported_efforts": ["low", "high"]}
+
+    handler = _DummyHandler()
+    with (
+        patch("api.routes._session_id_visible_to_request_profile", return_value=True),
+        patch("api.routes.get_session", side_effect=KeyError("gone")),
+        patch("api.routes.get_reasoning_status", side_effect=status),
+    ):
+        handle_get(handler, urlparse("/api/reasoning?model=gpt-5&session_id=gone"))
+
+    # Master's answer, not a 404 that hides the chip and re-fires every sync.
+    assert handler.status == 200
+    assert "effort_override" not in captured
+
+
+@pytest.mark.parametrize("session_effort", ["low", "", None])
+def test_effective_session_effort_shares_one_legacy_source(
+    isolated_reasoning_profiles, session_effort
+):
+    _root, work = isolated_reasoning_profiles
+    expected = "high" if session_effort is None else session_effort
+    assert config.effective_session_reasoning_effort(session_effort, work) == expected
+    if session_effort is None:
+        assert models._profile_default_reasoning_effort("work") == "high"
+
+
+@pytest.mark.parametrize("route", ["btw", "background"])
+def test_btw_and_background_children_inherit_parent_effort(
+    isolated_reasoning_profiles, tmp_path, route
+):
+    parent = Session(
+        session_id=f"parent-{route}", profile="default", model="gpt-5",
+        model_provider="openai", workspace=str(tmp_path), reasoning_effort="high",
+    )
+    models.SESSIONS[parent.session_id] = parent
+    created = []
+    real_new_session = models.new_session
+
+    def capture(*args, **kwargs):
+        child = real_new_session(*args, **kwargs)
+        created.append(child)
+        return child
+
+    body = {"session_id": parent.session_id}
+    body["question" if route == "btw" else "prompt"] = "hi"
+    handler = _DummyHandler(body, command="POST")
+    with (
+        patch("api.models.new_session", side_effect=capture),
+        patch("api.models.Session.save"),
+        patch("threading.Thread"),
+    ):
+        handle_post(handler, urlparse(f"/api/{route}"))
+
+    assert created, handler.status
+    # Profile default is "low"; the child must follow the parent's "high".
+    assert created[0].reasoning_effort == "high"
