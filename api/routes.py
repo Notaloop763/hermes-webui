@@ -29621,10 +29621,12 @@ def _handle_session_import(handler, body):
     model = body.get("model", DEFAULT_MODEL)
     reasoning_effort = body.get("reasoning_effort")
     if reasoning_effort is not None:
+        # A level this WebUI doesn't know (e.g. a CLI-only ``ultra``) must not
+        # reject the transcript; import it as legacy so the profile default applies.
         try:
             reasoning_effort = api_config.normalize_reasoning_effort(reasoning_effort)
         except ValueError:
-            return bad(handler, "Invalid reasoning_effort")
+            reasoning_effort = None
     s = Session(
         title=title,
         workspace=workspace,
