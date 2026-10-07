@@ -27,6 +27,14 @@ from api.routes import handle_get, handle_post
 REPO = Path(__file__).resolve().parents[1]
 
 
+@pytest.fixture(autouse=True)
+def _reload_config_after_test():
+    # Set up before (and torn down after) monkeypatch, so the cache is rebuilt
+    # from the restored environment instead of a deleted temp config.
+    yield
+    config.reload_config()
+
+
 class _DummyHandler:
     client_address = ("127.0.0.1", 12345)
 
@@ -174,7 +182,7 @@ def _post_reasoning(body, session, *, save_error=None, visible=True, config_erro
         patch("api.routes._get_session_agent_lock", return_value=_MutationLock()),
         patch(
             "api.routes.write_reasoning_effort",
-            side_effect=lambda effort: (
+            side_effect=lambda effort, *_a: (
                 events.append("config"),
                 (_ for _ in ()).throw(config_error) if config_error else None,
                 effort,
@@ -697,6 +705,104 @@ def test_reasoning_get_root_legacy_session_honors_external_config_while_named_ac
     assert handler.payload()["reasoning_effort"] == "xhigh"
 
 
+def _yaml_effort(path):
+    return config._config_reasoning_effort(config._load_yaml_config_file(path))
+
+
+@pytest.mark.parametrize("active", ["work", "default"])
+@pytest.mark.parametrize("config_location", ["root", "external", "unset"])
+@pytest.mark.parametrize("session_profile", ["work", "default", None], ids=["work", "root", "no-session"])
+def test_reasoning_pick_writes_the_profile_its_readers_use(
+    isolated_reasoning_profiles, tmp_path, monkeypatch, active, config_location, session_profile
+):
+    root, work = isolated_reasoning_profiles
+    external = tmp_path / "external.yaml"
+    if config_location == "external":
+        external.write_text("agent:\n  reasoning_effort: medium\n")
+        monkeypatch.setenv("HERMES_CONFIG_PATH", str(external))
+    elif config_location == "unset":
+        monkeypatch.delenv("HERMES_CONFIG_PATH", raising=False)
+    monkeypatch.setattr(profiles, "_active_profile", active)
+    config.reload_config()
+    root_file = external if config_location == "external" else root / "config.yaml"
+    files = {"default": root_file, "work": work / "config.yaml"}
+    before = {name: _yaml_effort(path) for name, path in files.items()}
+
+    body = {"effort": "xhigh", "model": "gpt-5", "provider": "openai"}
+    if session_profile is not None:
+        session = Session(
+            session_id="pick-session", profile=session_profile, model="gpt-5",
+            model_provider="openai", workspace=str(tmp_path), reasoning_effort="low",
+        )
+        models.SESSIONS[session.session_id] = session
+        body["session_id"] = session.session_id
+    handler = _DummyHandler(body, command="POST")
+    with patch("api.routes._session_id_visible_to_request_profile", return_value=True):
+        handle_post(handler, urlparse("/api/reasoning"))
+    assert handler.status == 200
+    assert handler.payload()["reasoning_effort"] == "xhigh"
+
+    # The pick lands in its own profile's file and no other.
+    owner = session_profile or active
+    for name, path in files.items():
+        assert _yaml_effort(path) == ("xhigh" if name == owner else before[name]), name
+    # The owner's next chat and every reader of its default now agree.
+    owner_home = profiles.get_hermes_home_for_profile(owner)
+    assert config.effective_session_reasoning_effort(None, owner_home) == "xhigh"
+    assert models.new_session(
+        workspace=str(tmp_path), model="gpt-5", profile=owner
+    ).reasoning_effort == "xhigh"
+    # The no-session chip reads the active profile's default from the same file.
+    handler = _DummyHandler()
+    handle_get(handler, urlparse("/api/reasoning?model=gpt-5&provider=openai"))
+    expected_active = "xhigh" if owner == active else before[active]
+    assert handler.payload()["reasoning_effort"] == expected_active
+    assert expected_active == config.effective_session_reasoning_effort(
+        None, profiles.get_hermes_home_for_profile(active)
+    )
+
+
+@pytest.mark.parametrize("missing", ["session", "active"])
+def test_reasoning_pick_for_missing_profile_keeps_chat_and_writes_no_other_profile(
+    isolated_reasoning_profiles, tmp_path, monkeypatch, missing
+):
+    root, work = isolated_reasoning_profiles
+    external = tmp_path / "external.yaml"
+    external.write_text("agent:\n  reasoning_effort: medium\n")
+    monkeypatch.setenv("HERMES_CONFIG_PATH", str(external))
+    if missing == "active":
+        monkeypatch.setattr(profiles, "_active_profile", "gone")
+    config.reload_config()
+    body = {"effort": "xhigh", "model": "gpt-5", "provider": "openai"}
+    if missing == "session":
+        session = Session(
+            session_id="gone-chat", profile="gone", model="gpt-5",
+            model_provider="openai", workspace=str(tmp_path), reasoning_effort="low",
+        )
+        models.SESSIONS[session.session_id] = session
+        body["session_id"] = session.session_id
+    handler = _DummyHandler(body, command="POST")
+    with patch("api.routes._session_id_visible_to_request_profile", return_value=True):
+        handle_post(handler, urlparse("/api/reasoning"))
+
+    if missing == "session":
+        # The chat keeps its own pick even though its profile has no config left.
+        assert handler.status == 200
+        assert session.reasoning_effort == "xhigh"
+        assert handler.payload()["reasoning_effort"] == "xhigh"
+    else:
+        # Nothing could store the pick, so it is refused rather than shown.
+        assert handler.status == 400
+        handler = _DummyHandler()
+        handle_get(handler, urlparse("/api/reasoning?model=gpt-5&provider=openai"))
+        # The no-session chip reports what the missing profile's readers use.
+        assert handler.payload()["reasoning_effort"] == ""
+    # Never redirected into another profile's file.
+    assert _yaml_effort(external) == "medium"
+    assert _yaml_effort(root / "config.yaml") == "low"
+    assert _yaml_effort(work / "config.yaml") == "high"
+
+
 def test_reasoning_get_unloadable_session_keeps_profile_answer():
     captured = {}
 
@@ -818,7 +924,7 @@ def test_overlapping_reasoning_posts_for_one_session_do_not_interleave(
     release_low = threading.Event()
     order = []
 
-    def fake_profile_write(effort):
+    def fake_profile_write(effort, *_a):
         if effort == "low":
             low_in_config.set()
             assert release_low.wait(5)
