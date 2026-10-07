@@ -16311,7 +16311,14 @@ def handle_post(handler, parsed) -> bool:
                         reasoning_session.reasoning_effort = previous_effort
                         raise
                     try:
-                        write_reasoning_effort(effort)
+                        from api.profiles import get_hermes_home_for_profile
+
+                        write_reasoning_effort(
+                            effort,
+                            get_hermes_home_for_profile(
+                                getattr(reasoning_session, "profile", None)
+                            ),
+                        )
                     except Exception:
                         reasoning_session.reasoning_effort = previous_effort
                         try:

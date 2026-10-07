@@ -723,6 +723,84 @@ def _load_yaml_config_file(config_path: Path) -> dict:
     return expanded if isinstance(expanded, dict) else {}
 
 
+_AMBIENT_CONFIG = object()
+
+
+def _profile_home_config_source(
+    profile_home: "Path | str | None", *, isolate_config_override: bool = False,
+):
+    """Pick the config file :func:`get_config_for_profile_home` reads.
+
+    Returns ``_AMBIENT_CONFIG`` for the ambient ``get_config()`` (whose file is
+    ``_get_config_path()``), ``None`` for a missing profile home, or the
+    profile's own ``config.yaml``.
+    """
+    if not profile_home:
+        return _AMBIENT_CONFIG
+    try:
+        target = Path(profile_home).expanduser()
+    except Exception:
+        return _AMBIENT_CONFIG
+
+    from api.workspace import _safe_resolve as _cfg_safe_resolve
+
+    # Canonicalize BOTH sides before every identity comparison (#7168 re-gate
+    # round 5): when HERMES_HOME (or the config parent) is a symlink alias,
+    # lexical equality fails and an authoritative HERMES_CONFIG_PATH inside
+    # the aliased home would be bypassed in favor of a direct — wrong — read.
+    target = _cfg_safe_resolve(target)
+    try:
+        from api.profiles import get_active_hermes_home, get_hermes_home_for_profile
+
+        root_home = _cfg_safe_resolve(get_hermes_home_for_profile("default"))
+        override = os.getenv("HERMES_CONFIG_PATH")
+        # Resolve the folder, not the file: a symlinked config.yaml belongs to the
+        # profile home it sits in, not to wherever its target lives.
+        override_path = None
+        if override:
+            _override_raw = Path(override).expanduser()
+            override_path = _cfg_safe_resolve(_override_raw.parent) / _override_raw.name
+        # An external override is the root profile's config whichever named
+        # profile is process-active, unless it lives under a named profile home.
+        if (
+            isolate_config_override and override_path is not None
+            and target == root_home
+            and not override_path.is_relative_to(_cfg_safe_resolve(root_home / "profiles"))
+        ):
+            return _AMBIENT_CONFIG
+        # Root is handled above; an override under <root>/profiles belongs to
+        # that named profile, never to root, so root must not match it here.
+        override_matches = (
+            not isolate_config_override
+            or override_path is None
+            or (target != root_home and override_path.is_relative_to(target))
+        )
+        active_home = _cfg_safe_resolve(Path(get_active_hermes_home()).expanduser())
+        if override_matches and active_home == target:
+            return _AMBIENT_CONFIG
+    except Exception:
+        pass
+    # If the ambient resolver already points at this profile home, defer to
+    # get_config() so in-memory overrides (monkeypatched cfg) are honored. This
+    # MUST run before the nonexistent-home guard below: a matching ambient home
+    # whose directory doesn't physically exist yet (fresh install, monkeypatched
+    # cfg) must still resolve through get_config(), not return {} (#4516 gate).
+    try:
+        # Resolve the parent directory, not the file, so a symlinked config.yaml
+        # still matches its own home (master's comparison).
+        config_parent = _cfg_safe_resolve(_get_config_path().parent)
+        if config_parent == target or (
+            isolate_config_override and target != root_home
+            and config_parent.is_relative_to(target)
+        ):
+            return _AMBIENT_CONFIG
+    except Exception:
+        pass
+    if not target.exists():
+        return None
+    return target / "config.yaml"
+
+
 def get_config_for_profile_home(
     profile_home: "Path | str | None", *, isolate_config_override: bool = False,
 ) -> dict:
@@ -756,75 +834,30 @@ def get_config_for_profile_home(
     ``config.yaml`` yields defaults — neither ever falls back to the ambient
     config (profiles-are-islands).
     """
-    if not profile_home:
+    source = _profile_home_config_source(
+        profile_home, isolate_config_override=isolate_config_override
+    )
+    if source is _AMBIENT_CONFIG:
         return get_config()
-    try:
-        target = Path(profile_home).expanduser()
-    except Exception:
-        return get_config()
-
-    from api.workspace import _safe_resolve as _cfg_safe_resolve
-
-    # Canonicalize BOTH sides before every identity comparison (#7168 re-gate
-    # round 5): when HERMES_HOME (or the config parent) is a symlink alias,
-    # lexical equality fails and an authoritative HERMES_CONFIG_PATH inside
-    # the aliased home would be bypassed in favor of a direct — wrong — read.
-    target = _cfg_safe_resolve(target)
-    try:
-        from api.profiles import get_active_hermes_home, get_hermes_home_for_profile
-
-        root_home = _cfg_safe_resolve(get_hermes_home_for_profile("default"))
-        override = os.getenv("HERMES_CONFIG_PATH")
-        # Resolve the folder, not the file: a symlinked config.yaml belongs to the
-        # profile home it sits in, not to wherever its target lives.
-        override_path = None
-        if override:
-            _override_raw = Path(override).expanduser()
-            override_path = _cfg_safe_resolve(_override_raw.parent) / _override_raw.name
-        # An external override is the root profile's config whichever named
-        # profile is process-active, unless it lives under a named profile home.
-        if (
-            isolate_config_override and override_path is not None
-            and target == root_home
-            and not override_path.is_relative_to(_cfg_safe_resolve(root_home / "profiles"))
-        ):
-            return get_config()
-        # Root is handled above; an override under <root>/profiles belongs to
-        # that named profile, never to root, so root must not match it here.
-        override_matches = (
-            not isolate_config_override
-            or override_path is None
-            or (target != root_home and override_path.is_relative_to(target))
-        )
-        active_home = _cfg_safe_resolve(Path(get_active_hermes_home()).expanduser())
-        if override_matches and active_home == target:
-            return get_config()
-    except Exception:
-        pass
-    # If the ambient resolver already points at this profile home, defer to
-    # get_config() so in-memory overrides (monkeypatched cfg) are honored. This
-    # MUST run before the nonexistent-home guard below: a matching ambient home
-    # whose directory doesn't physically exist yet (fresh install, monkeypatched
-    # cfg) must still resolve through get_config(), not return {} (#4516 gate).
-    try:
-        # Resolve the parent directory, not the file, so a symlinked config.yaml
-        # still matches its own home (master's comparison).
-        config_parent = _cfg_safe_resolve(_get_config_path().parent)
-        if config_parent == target or (
-            isolate_config_override and target != root_home
-            and config_parent.is_relative_to(target)
-        ):
-            return get_config()
-    except Exception:
-        pass
-    if not target.exists():
+    if source is None:
         return {}
     # Read the profile file directly and apply documented defaults locally so the
     # returned dict matches ambient get_config() shape (including built-in
     # personalities) without mutating any global cache state.
-    profile_cfg = _load_yaml_config_file(target / "config.yaml")
+    profile_cfg = _load_yaml_config_file(source)
     _apply_config_defaults(profile_cfg)
     return profile_cfg
+
+
+def isolated_profile_config_path(profile_home: "Path | str | None") -> "Path | None":
+    """Return the file ``get_config_for_profile_home(..., isolate_config_override=True)``
+    reads for ``profile_home`` (``None`` when that home does not exist).
+
+    Lets the reasoning-effort chip and its writer use the same file as the
+    isolated readers (session defaults, local and Gateway workers).
+    """
+    source = _profile_home_config_source(profile_home, isolate_config_override=True)
+    return _get_config_path() if source is _AMBIENT_CONFIG else source
 
 
 def _config_for_yaml_save(config_data: dict) -> dict:
@@ -6034,11 +6067,17 @@ def get_reasoning_status(
     """
     config_data = _load_yaml_config_file(_get_config_path())
     display_cfg = config_data.get("display") or {}
-    agent_cfg = config_data.get("agent") or {}
     show_raw = display_cfg.get("show_reasoning") if isinstance(display_cfg, dict) else None
-    effort_raw = agent_cfg.get("reasoning_effort") if isinstance(agent_cfg, dict) else None
     if effort_override is not _REASONING_EFFORT_UNSET:
         effort_raw = effort_override
+    else:
+        # The profile default comes from the same isolated file the session
+        # readers and write_reasoning_effort() use, not the ambient override.
+        default_path = _active_isolated_config_path()
+        effort_raw = (
+            _config_reasoning_effort(_load_yaml_config_file(default_path))
+            if default_path is not None else ""
+        )
 
     resolve_model = model_id
     resolve_provider = provider_id
@@ -6228,15 +6267,39 @@ def set_reasoning_effort(
     )
 
 
-def write_reasoning_effort(effort: str) -> str:
-    """Write ``agent.reasoning_effort`` to the active profile's config.yaml.
+def _active_isolated_config_path() -> "Path | None":
+    from api.profiles import get_active_hermes_home
+
+    return isolated_profile_config_path(get_active_hermes_home())
+
+
+def write_reasoning_effort(effort: str, profile_home: "Path | str | None" = None) -> str:
+    """Write ``agent.reasoning_effort`` to a profile's config.yaml.
 
     The local file write half of :func:`set_reasoning_effort`, without the
     capability lookup (which may do network I/O), so callers can hold a
-    session lock across it. Returns the normalized stored value.
+    session lock across it. ``profile_home`` (default: the active profile)
+    selects the file through :func:`isolated_profile_config_path`, the same
+    file every reader of the profile default uses. A missing profile home is
+    never redirected to another profile's file: for a session's profile the
+    write is skipped (the session keeps its own value, and the profile's
+    readers see ``""``); for the active profile, where the profile default is
+    the only thing saved, it raises ``ValueError``. Returns the normalized
+    stored value.
     """
     raw = normalize_reasoning_effort(effort)
-    config_path = _get_config_path()
+    if profile_home is None:
+        config_path = _active_isolated_config_path()
+        if config_path is None:
+            raise ValueError("The active profile no longer exists.")
+    else:
+        config_path = isolated_profile_config_path(profile_home)
+        if config_path is None:
+            logger.warning(
+                "reasoning effort: profile home %s is missing; profile default not written",
+                profile_home,
+            )
+            return raw
     with _cfg_lock:
         config_data = _load_yaml_config_file(config_path)
         agent_cfg = config_data.get("agent")
