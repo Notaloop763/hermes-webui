@@ -5468,13 +5468,25 @@ function _reasoningSaveOwner(profile, context){
   return profile+'\n'+((context&&context.session_id)||'');
 }
 
+// While frozen the effort controls are disabled, so a pick is never accepted
+// by the UI and then dropped; /reasoning still reports the refusal in a toast.
+function _setReasoningControlsFrozen(frozen){
+  ['composerReasoningChip','composerMobileReasoningAction'].forEach(function(id){
+    const btn=$(id);
+    if(btn) btn.disabled=frozen;
+  });
+  if(frozen) closeReasoningDropdown();
+}
+
 async function _beginReasoningProfileSwitch(){
   ++_reasoningSavesFrozen;
+  _setReasoningControlsFrozen(true);
   await _reasoningSaveChain;
 }
 
 function _endReasoningProfileSwitch(){
   if(_reasoningSavesFrozen>0) --_reasoningSavesFrozen;
+  if(!_reasoningSavesFrozen) _setReasoningControlsFrozen(false);
 }
 
 function _saveReasoningEffort(effort){
@@ -5703,6 +5715,7 @@ function toggleReasoningDropdown(){
   if(!dd||!chip) return;
   const open=dd.classList.contains('open');
   if(open){closeReasoningDropdown();return;}
+  if(_reasoningSavesFrozen) return;
   if(typeof closeProfileDropdown==='function') closeProfileDropdown();
   if(typeof closeWsDropdown==='function') closeWsDropdown();
   closeModelDropdown();
