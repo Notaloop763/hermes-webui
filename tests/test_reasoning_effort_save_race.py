@@ -170,7 +170,7 @@ const root = process.argv[2];
 const [entry, change] = JSON.parse(process.argv[3]);
 function el() {
   return {style:{}, dataset:{}, textContent:'', value:'',
-    classList:{toggle(){},remove(){},add(){},contains(){return false}},
+    classList:(()=>{const c=new Set(); return {toggle(k,on){(on===undefined?!c.has(k):on)?c.add(k):c.delete(k);},remove(k){c.delete(k)},add(k){c.add(k)},contains(k){return c.has(k)}};})(),
     setAttribute(){}, querySelectorAll(){return []}};
 }
 const els = Object.fromEntries(['modelSelect','composerReasoningWrap',
@@ -210,18 +210,26 @@ function pick(effort) {
   if(change==='profile_switch') {
     pick('high'); await flush();
     pick('low'); await flush();
+    els.composerReasoningDropdown.classList.add('open');
     const begun = run('_beginReasoningProfileSwitch()');
     let drained = false; begun.then(()=>{drained=true;});
+    const controlsFrozen = els.composerReasoningChip.disabled===true
+      && els.composerMobileReasoningAction.disabled===true;
+    run('toggleReasoningDropdown()');
+    const opened = els.composerReasoningDropdown.classList.contains('open');
     pick('high'); await flush();  // frozen: must not be queued under either cookie
     posts()[0].ok(status('high')); await flush();
     const drainedEarly = drained;
     posts()[1].ok(status('low')); await flush();
     const drainedAfter = drained;
     run("S.activeProfile='work'; _endReasoningProfileSwitch()");
+    const controlsReleased = els.composerReasoningChip.disabled===false
+      && els.composerMobileReasoningAction.disabled===false;
     pick('high'); await flush();
     process.stdout.write(JSON.stringify({
       bodies: posts().map(r=>JSON.parse(r.options.body).effort),
-      profiles: posts().map(r=>r.profile), drainedEarly, drainedAfter}));
+      profiles: posts().map(r=>r.profile), drainedEarly, drainedAfter,
+      controlsFrozen, opened, controlsReleased}));
     return;
   }
   // A picks High (delayed), B picks Low, return to A before either completes.
@@ -274,6 +282,10 @@ def test_profile_switch_drains_queued_saves_under_old_profile(tmp_path, entry):
     assert out["profiles"] == ["default", "default", "work"]
     assert out["drainedEarly"] is False
     assert out["drainedAfter"] is True
+    # The controls are disabled (and the dropdown can't open) for the whole freeze.
+    assert out["controlsFrozen"] is True
+    assert out["opened"] is False
+    assert out["controlsReleased"] is True
 
 
 def test_both_profile_switch_paths_drain_reasoning_saves():
