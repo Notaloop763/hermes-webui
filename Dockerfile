@@ -40,28 +40,35 @@ RUN apt-get update -y --fix-missing --no-install-recommends \
 
 # ── Python 3.14 (python-build-standalone) ───────────────────────────────────
 # Same artifacts and sha256 digests as hermes-agent pm/lock.json at v0.21.6.
-# Installed to PYTHON_HOME with python3 symlinks in /usr/local/bin, mirroring
-# the agent image's /usr/local/bin/python3 -> managed Python layout. When the
-# agent pin moves, bump these ARGs together from its pm/lock.json.
+# Installed at the Agent's managed-store path (pm store_entry is
+# "<name>-<version>-<target>" under HERMES_RUNTIME_DIR=/opt/hermes/tools) so a
+# shared Mnemosyne venv records a base interpreter both containers can execute.
+# uv canonicalizes symlinked standalone Pythons, so this is the real directory;
+# /opt/python is only a convenience link. When the agent pin moves, bump these
+# ARGs together from its pm/lock.json.
 ARG PYTHON_VERSION=3.14.7
 ARG PYTHON_PBS_RELEASE=20260901
 ARG PYTHON_SHA256_X64=0ab3305457051cd3e7c031857e005f1bda17c218a1990567dacaaac6dd1d14f0
 ARG PYTHON_SHA256_ARM64=30f1cc489be654477d895b441e196bb080738bf0456da82080ad4ab66a22d80f
-ARG PYTHON_HOME=/opt/python
+ARG PYTHON_STORE=/opt/hermes/tools
 ARG TARGETARCH
+COPY --chmod=444 docker/python/sitecustomize.py /usr/local/share/hermes/sitecustomize.py
 RUN case "${TARGETARCH:-$(dpkg --print-architecture)}" in \
-        amd64) triple=x86_64-unknown-linux-gnu; sha="${PYTHON_SHA256_X64}" ;; \
-        arm64) triple=aarch64-unknown-linux-gnu; sha="${PYTHON_SHA256_ARM64}" ;; \
+        amd64) triple=x86_64-unknown-linux-gnu; pmt=linux-x64; sha="${PYTHON_SHA256_X64}" ;; \
+        arm64) triple=aarch64-unknown-linux-gnu; pmt=linux-arm64; sha="${PYTHON_SHA256_ARM64}" ;; \
         *) echo "unsupported architecture: ${TARGETARCH}" >&2; exit 1 ;; \
     esac \
+    && home="${PYTHON_STORE}/python-${PYTHON_VERSION}+${PYTHON_PBS_RELEASE}-${pmt}" \
     && curl -fsSL "https://github.com/astral-sh/python-build-standalone/releases/download/${PYTHON_PBS_RELEASE}/cpython-${PYTHON_VERSION}+${PYTHON_PBS_RELEASE}-${triple}-install_only.tar.gz" -o /tmp/python.tar.gz \
     && echo "${sha}  /tmp/python.tar.gz" | sha256sum -c - \
-    && mkdir -p "${PYTHON_HOME}" \
-    && tar -xzf /tmp/python.tar.gz -C "${PYTHON_HOME}" --strip-components=1 \
+    && mkdir -p "${home}" \
+    && tar -xzf /tmp/python.tar.gz -C "${home}" --strip-components=1 \
     && rm -f /tmp/python.tar.gz \
-    && ln -s "${PYTHON_HOME}/bin/python3" /usr/local/bin/python3 \
-    && ln -s "${PYTHON_HOME}/bin/python3" /usr/local/bin/python3.14 \
-    && ln -s "${PYTHON_HOME}/bin/python3" /usr/local/bin/python \
+    && ln -s "${home}" /opt/python \
+    && install -m 0444 /usr/local/share/hermes/sitecustomize.py "${home}/lib/python3.14/sitecustomize.py" \
+    && ln -s "${home}/bin/python3" /usr/local/bin/python3 \
+    && ln -s "${home}/bin/python3" /usr/local/bin/python3.14 \
+    && ln -s "${home}/bin/python3" /usr/local/bin/python \
     && python3 -c "import sys; assert sys.version_info[:2] == (3, 14), sys.version"
 
 # ── SQLite upgrade ──────────────────────────────────────────────────────────
@@ -106,7 +113,18 @@ assert c.execute('PRAGMA secure_delete').fetchone()[0] == 1, \
     'SQLITE_SECURE_DELETE not compiled in (deleted rows would remain recoverable)'; \
 c.execute('CREATE VIRTUAL TABLE _fts5_build_check USING fts5(x)'); \
 c.execute('DROP TABLE _fts5_build_check'); \
-c.close()"
+c.close()" \
+    && python3 -I -c "\
+import ctypes, sys, _sqlite3, sqlite3; \
+lib = ctypes.CDLL('/usr/local/lib/libsqlite3.so.0'); \
+lib.sqlite3_compileoption_used.argtypes = [ctypes.c_char_p]; \
+assert lib.sqlite3_compileoption_used(b'SECURE_DELETE') == 1, \
+    'built libsqlite3 lacks SECURE_DELETE'; \
+assert '_sqlite3' in sys.builtin_module_names, \
+    'PBS layout changed (_sqlite3 no longer builtin): re-evaluate docker/python/sitecustomize.py'; \
+assert _sqlite3.connect(':memory:').execute('PRAGMA secure_delete').fetchone()[0] == 0, \
+    'PBS now compiles SECURE_DELETE: sitecustomize shim is redundant'; \
+assert sqlite3.connect._hermes_secure_delete, 'sitecustomize shim not active'"
 
 # Optional GPU user-space acceleration libraries for users who pass through
 # host GPU devices. The default image remains CPU-only.
@@ -163,6 +181,14 @@ USER root
 # Installing as root places uv in /usr/local/bin, available to all users.
 # The init script will skip the download when uv is already on PATH.
 RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh
+
+# Prove the SQLite secure_delete property and interpreter path inside a real uv
+# venv, the shape the app and a shared Mnemosyne venv use.
+RUN d="$(mktemp -d)" \
+    && uv venv -q --python /usr/local/bin/python3 "$d/v" \
+    && grep -qE "^home = /opt/hermes/tools/python-.*/bin$" "$d/v/pyvenv.cfg" \
+    && "$d/v/bin/python" -I -c "import sqlite3; assert sqlite3.connect(':memory:').execute('PRAGMA secure_delete').fetchone()[0] == 1" \
+    && rm -rf "$d"
 
 COPY --chown=root:root . /apptoo
 
