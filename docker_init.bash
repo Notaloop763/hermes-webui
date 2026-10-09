@@ -413,7 +413,7 @@ if [ -f /app/venv/bin/python3 ]; then
   echo ""; echo "== Existing virtual environment found — reusing (fast restart)"
 else
   echo ""; echo "== Creating new virtual environment"
-  uv venv venv
+  uv venv --python "${HERMES_WEBUI_PYTHON:-/usr/local/bin/python3}" venv
 fi
 export VIRTUAL_ENV=/app/venv
 test -d /app/venv
