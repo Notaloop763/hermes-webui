@@ -885,7 +885,7 @@ else
     UV_PYTHON="$_venv_python" uv venv venv \
       || error_exit "Failed to create the virtual environment on Python $_venv_python"
   else
-    uv venv venv
+    uv venv --python "${HERMES_WEBUI_PYTHON:-/usr/local/bin/python3}" venv
   fi
 fi
 export VIRTUAL_ENV=/app/venv
