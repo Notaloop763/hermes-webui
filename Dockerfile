@@ -1,8 +1,8 @@
-# Python 3.13 from Debian 13 (trixie), matching the agent image's interpreter
-# location (/usr/bin/python3.13, stdlib /usr/lib/python3.13) so a Mnemosyne
-# side venv created here is usable by the agent container too. The WebUI project
-# supports Python 3.11-3.13 (pyproject requires-python >=3.11; scripts/test.sh
-# probes python3.13 first).
+# Python 3.14 from the same python-build-standalone release the Hermes Agent
+# image pins in pm/lock.json (hermes-agent v0.21.6: CPython 3.14.7+20260901), so
+# a Mnemosyne side venv created here uses the same interpreter build as the
+# agent container. The WebUI project supports Python 3.11-3.14 (pyproject
+# requires-python >=3.11; scripts/test.sh probes python3.14 first).
 FROM debian:13.4
 
 LABEL maintainer="nesquena"
@@ -37,6 +37,32 @@ RUN apt-get update -y --fix-missing --no-install-recommends \
     && apt-get upgrade -y \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
+
+# ── Python 3.14 (python-build-standalone) ───────────────────────────────────
+# Same artifacts and sha256 digests as hermes-agent pm/lock.json at v0.21.6.
+# Installed to PYTHON_HOME with python3 symlinks in /usr/local/bin, mirroring
+# the agent image's /usr/local/bin/python3 -> managed Python layout. When the
+# agent pin moves, bump these ARGs together from its pm/lock.json.
+ARG PYTHON_VERSION=3.14.7
+ARG PYTHON_PBS_RELEASE=20260901
+ARG PYTHON_SHA256_X64=0ab3305457051cd3e7c031857e005f1bda17c218a1990567dacaaac6dd1d14f0
+ARG PYTHON_SHA256_ARM64=30f1cc489be654477d895b441e196bb080738bf0456da82080ad4ab66a22d80f
+ARG PYTHON_HOME=/opt/python
+ARG TARGETARCH
+RUN case "${TARGETARCH:-$(dpkg --print-architecture)}" in \
+        amd64) triple=x86_64-unknown-linux-gnu; sha="${PYTHON_SHA256_X64}" ;; \
+        arm64) triple=aarch64-unknown-linux-gnu; sha="${PYTHON_SHA256_ARM64}" ;; \
+        *) echo "unsupported architecture: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac \
+    && curl -fsSL "https://github.com/astral-sh/python-build-standalone/releases/download/${PYTHON_PBS_RELEASE}/cpython-${PYTHON_VERSION}+${PYTHON_PBS_RELEASE}-${triple}-install_only.tar.gz" -o /tmp/python.tar.gz \
+    && echo "${sha}  /tmp/python.tar.gz" | sha256sum -c - \
+    && mkdir -p "${PYTHON_HOME}" \
+    && tar -xzf /tmp/python.tar.gz -C "${PYTHON_HOME}" --strip-components=1 \
+    && rm -f /tmp/python.tar.gz \
+    && ln -s "${PYTHON_HOME}/bin/python3" /usr/local/bin/python3 \
+    && ln -s "${PYTHON_HOME}/bin/python3" /usr/local/bin/python3.14 \
+    && ln -s "${PYTHON_HOME}/bin/python3" /usr/local/bin/python \
+    && python3 -c "import sys; assert sys.version_info[:2] == (3, 14), sys.version"
 
 # ── SQLite upgrade ──────────────────────────────────────────────────────────
 # The Debian 13 base ships SQLite 3.46.1 (Trixie), which is
