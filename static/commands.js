@@ -2049,14 +2049,12 @@ function cmdReasoning(args){
   if(EFFORTS.includes(arg)){
     // Persist the profile default and the active session override together.
     // The next turn rebuilds the cached agent with this session-owned value.
-    const context=_reasoningEffortContext();
-    const profile=(S&&S.activeProfile)||'default';
-    const payload=Object.assign({effort:arg},context);
-    api('/api/reasoning',{method:'POST',body:JSON.stringify(payload)})
+    // _saveReasoningEffort POSTs {effort:arg} plus the active session context
+    // to /api/reasoning, in pick order, and applies the server-confirmed chip.
+    _saveReasoningEffort(arg)
       .then(function(st){
         const eff=(st && st.reasoning_effort)||arg;
         showToast(BRAIN+' Reasoning effort: '+eff+' (saved; applies to next turn)');
-        _applyReasoningSaveResult(context, profile, eff, st||{});
       })
       .catch(function(e){
         showToast(BRAIN+' Failed to set effort: '+(e && e.message ? e.message : arg));

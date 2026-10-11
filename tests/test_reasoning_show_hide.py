@@ -283,7 +283,10 @@ class TestReasoningCommand:
             "cmdReasoning must POST effort levels to /api/reasoning so "
             "config.yaml agent.reasoning_effort is updated (CLI parity)"
         )
-        assert "'effort:'" in fn or 'effort:arg' in fn or 'effort: arg' in fn, (
+        assert (
+            "'effort:'" in fn or 'effort:arg' in fn or 'effort: arg' in fn
+            or '_saveReasoningEffort(arg)' in fn
+        ), (
             "effort-level branch must send {effort: arg} to /api/reasoning"
         )
         # Must NOT still hold a dead local-only variable for effort.
@@ -464,7 +467,7 @@ class TestReasoningRoutes:
 
     def test_post_api_reasoning_accepts_effort(self):
         src = read('api/routes.py')
-        assert 'set_reasoning_effort' in src, (
+        assert 'write_reasoning_effort' in src, (
             "POST /api/reasoning must route effort changes through "
-            "set_reasoning_effort"
+            "write_reasoning_effort"
         )

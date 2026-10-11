@@ -3025,6 +3025,9 @@ from api.config import (
     get_reasoning_status,
     set_reasoning_display,
     set_reasoning_effort,
+    write_reasoning_effort,
+    normalize_reasoning_effort,
+    effective_session_reasoning_effort,
     create_stream_channel,
     publish_pre_admission_claim,
     retire_pre_admission_claim_if_owned,
@@ -14994,16 +14997,22 @@ def handle_get(handler, parsed) -> bool:
         base_url = (query.get("base_url", [""])[0] or "").strip() or None
         session_id = (query.get("session_id", [""])[0] or "").strip() or None
         effort_kwargs = {}
+        # Profile visibility for session_id is enforced by
+        # _guard_request_session_visibility before routing. A session that
+        # cannot be loaded (deleted, failed external import) keeps master's
+        # profile-config answer instead of hiding the chip.
         if session_id:
-            if not _session_id_visible_to_request_profile(handler, session_id):
-                return True
             try:
                 reasoning_session = get_session(session_id, metadata_only=True)
             except KeyError:
-                return bad(handler, "Session not found", 404)
-            session_effort = getattr(reasoning_session, "reasoning_effort", None)
-            if session_effort is not None:
-                effort_kwargs["effort_override"] = session_effort
+                reasoning_session = None
+            if reasoning_session is not None:
+                from api.profiles import get_hermes_home_for_profile
+
+                effort_kwargs["effort_override"] = effective_session_reasoning_effort(
+                    getattr(reasoning_session, "reasoning_effort", None),
+                    get_hermes_home_for_profile(getattr(reasoning_session, "profile", None)),
+                )
         return j(
             handler,
             get_reasoning_status(
@@ -16774,29 +16783,81 @@ def handle_post(handler, parsed) -> bool:
                 provider_id = str(body.get("provider") or "").strip() or None
                 base_url = str(body.get("base_url") or "").strip() or None
                 session_id = str(body.get("session_id") or "").strip() or None
+                normalized_effort = normalize_reasoning_effort(effort)
+
                 reasoning_session = None
                 if session_id:
+                    # Profile visibility for body session_id is enforced by
+                    # _guard_request_session_visibility before routing.
                     try:
                         reasoning_session = _get_or_materialize_session(session_id)
                     except KeyError:
                         return bad(handler, "Session not found", 404)
                     except PermissionError:
-                        return bad(handler, "Read-only imported sessions cannot be updated from WebUI", 403)
-                status = set_reasoning_effort(
-                    effort,
-                    model_id=model_id,
-                    provider_id=provider_id,
-                    base_url=base_url,
+                        # Read-only, messaging and subagent chats cannot own an
+                        # effort; keep master's profile-default-only save.
+                        reasoning_session = None
+                if reasoning_session is None:
+                    return j(
+                        handler,
+                        set_reasoning_effort(
+                            effort,
+                            model_id=model_id,
+                            provider_id=provider_id,
+                            base_url=base_url,
+                        ),
+                    )
+                # One serialized step per session: overlapping POSTs for the same
+                # chat cannot interleave their session and profile writes. Only
+                # local file writes run under the lock; the capability lookup
+                # (possible network I/O) runs after it is released. The session
+                # is saved first so a failed save never changes only config.yaml;
+                # a failed profile write restores the session. The cached agent
+                # is rebuilt on its next turn because reasoning_config is part of
+                # the agent cache signature.
+                with _get_session_agent_lock(session_id):
+                    previous_effort = getattr(reasoning_session, "reasoning_effort", None)
+                    reasoning_session.reasoning_effort = normalized_effort
+                    try:
+                        # A preference change is not conversation activity.
+                        reasoning_session.save(touch_updated_at=False)
+                    except Exception:
+                        # Keep the cached session equal to its sidecar.
+                        reasoning_session.reasoning_effort = previous_effort
+                        raise
+                    try:
+                        from api.profiles import get_hermes_home_for_profile
+
+                        write_reasoning_effort(
+                            effort,
+                            get_hermes_home_for_profile(
+                                getattr(reasoning_session, "profile", None)
+                            ),
+                        )
+                    except Exception:
+                        reasoning_session.reasoning_effort = previous_effort
+                        try:
+                            reasoning_session.save(touch_updated_at=False)
+                        except Exception:
+                            # The sidecar kept the new value; match it in memory
+                            # and surface the original profile-write error.
+                            reasoning_session.reasoning_effort = normalized_effort
+                            logger.warning(
+                                "reasoning effort rollback save failed for %s",
+                                session_id, exc_info=True,
+                            )
+                        raise
+                # Report this session's stored value, not the shared profile
+                # default another chat may have rewritten since the lock was released.
+                return j(
+                    handler,
+                    get_reasoning_status(
+                        model_id=model_id,
+                        provider_id=provider_id,
+                        base_url=base_url,
+                        effort_override=normalized_effort,
+                    ),
                 )
-                if reasoning_session is not None:
-                    with _get_session_agent_lock(session_id):
-                        reasoning_session.reasoning_effort = str(effort or "").strip().lower()
-                        reasoning_session.save()
-                    # Cache eviction can commit agent lifecycle state and may do
-                    # provider I/O, so keep it outside the session mutation lock.
-                    from api.config import _evict_session_agent
-                    _evict_session_agent(session_id)
-                return j(handler, status)
             return bad(handler, "reasoning: must supply 'display' or 'effort'")
         except ValueError as e:
             return bad(handler, str(e))
@@ -23940,6 +24001,8 @@ def _handle_btw(handler, body):
         model_provider=model_provider,
         profile=getattr(s, 'profile', None),
     )
+    # Inherit the parent's session-owned effort alongside its model.
+    ephemeral.reasoning_effort = getattr(s, 'reasoning_effort', None)
     # Copy conversation history for context (agent reads from messages)
     ephemeral.messages = list(s.messages or [])
     ephemeral.title = f"btw: {question[:60]}"
@@ -24012,6 +24075,7 @@ def _handle_background(handler, body):
         model_provider=model_provider,
         profile=getattr(s, 'profile', None),
     )
+    bg.reasoning_effort = getattr(s, 'reasoning_effort', None)
     bg.title = f"bg: {prompt[:60]}"
     bg.save()
     from api.session_ops import snapshot_session_state
@@ -31221,13 +31285,12 @@ def _handle_session_import(handler, body):
     model = body.get("model", DEFAULT_MODEL)
     reasoning_effort = body.get("reasoning_effort")
     if reasoning_effort is not None:
-        reasoning_effort = str(reasoning_effort or "").strip().lower()
-        if (
-            reasoning_effort
-            and reasoning_effort != "none"
-            and reasoning_effort not in api_config.VALID_REASONING_EFFORTS
-        ):
-            return bad(handler, "Invalid reasoning_effort")
+        # A level this WebUI doesn't know (e.g. a CLI-only ``ultra``) must not
+        # reject the transcript; import it as legacy so the profile default applies.
+        try:
+            reasoning_effort = api_config.normalize_reasoning_effort(reasoning_effort)
+        except ValueError:
+            reasoning_effort = None
     s = Session(
         title=title,
         workspace=workspace,
