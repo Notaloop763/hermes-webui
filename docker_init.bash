@@ -483,6 +483,9 @@ else
     #
     # The copy excludes any pre-baked `*.egg-info` / `build` / `dist` artifacts
     # to avoid the timestamp-update path setuptools takes when one is present.
+    # It also skips the agent's runtime-store lock (HERMES_RUNTIME_DIR is
+    # /opt/hermes/tools since v0.21.6): root-owned and unreadable to
+    # hermeswebui, it fails rsync with code 23.
     #
     # NB: `rsync -a` / `cp -a` preserve the source tree's mode bits, so a `:ro`
     # source mounted mode 555 leaves the staged copy also mode 555. setuptools
@@ -497,7 +500,7 @@ else
       rsync -a \
         --exclude='*.egg-info' --exclude='build' --exclude='dist' \
         --exclude='__pycache__' --exclude='.git' \
-        --exclude='.playwright' \
+        --exclude='.playwright' --exclude='/tools/.install.lock' \
         "$_agent_src"/ "$_stage_src"/ \
         || error_exit "Failed to stage hermes-agent source to writable build dir"
     else
