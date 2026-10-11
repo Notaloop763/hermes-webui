@@ -43,9 +43,10 @@ RUN apt-get update -y --fix-missing --no-install-recommends \
 # Installed at the Agent's managed-store path (pm store_entry is
 # "<name>-<version>-<target>" under HERMES_RUNTIME_DIR=/opt/hermes/tools) so a
 # shared Mnemosyne venv records a base interpreter both containers can execute.
-# uv canonicalizes symlinked standalone Pythons, so this is the real directory;
-# /opt/python is only a convenience link. When the agent pin moves, bump these
-# ARGs together from its pm/lock.json.
+# uv records the symlink's directory as a venv's home (/usr/local/bin for
+# /usr/local/bin/python3), which the agent image also provides; /opt/python is
+# only a convenience link. When the agent pin moves, bump these ARGs together
+# from its pm/lock.json.
 ARG PYTHON_VERSION=3.14.7
 ARG PYTHON_PBS_RELEASE=20260901
 ARG PYTHON_SHA256_X64=0ab3305457051cd3e7c031857e005f1bda17c218a1990567dacaaac6dd1d14f0
@@ -186,7 +187,7 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/b
 # venv, the shape the app and a shared Mnemosyne venv use.
 RUN d="$(mktemp -d)" \
     && uv venv -q --python /usr/local/bin/python3 "$d/v" \
-    && grep -qE "^home = /opt/hermes/tools/python-.*/bin$" "$d/v/pyvenv.cfg" \
+    && readlink -f "$d/v/bin/python" | grep -qE "^/opt/hermes/tools/python-[^/]*/bin/python3\.14$" \
     && "$d/v/bin/python" -I -c "import sqlite3; assert sqlite3.connect(':memory:').execute('PRAGMA secure_delete').fetchone()[0] == 1" \
     && rm -rf "$d"
 
