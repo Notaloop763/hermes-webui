@@ -270,6 +270,12 @@ def test_docker_init_excludes_egg_info_during_staging():
         ".playwright so the build doesn't choke on unreadable browser files."
     )
 
+    assert "--exclude='/tools/.install.lock'" in stage_block, (
+        "rsync staging must skip the agent runtime-store lock: it is root-owned "
+        "under /opt/hermes/tools, unreadable to hermeswebui, and fails rsync "
+        "with code 23."
+    )
+
 
 def test_docker_init_excludes_unreadable_install_lock_during_staging():
     """An unreadable `tools/.install.lock` in the agent source must not be staged.
