@@ -214,7 +214,7 @@ const compose = () => {
     },{visibility,oldFirst});
     reports.push({scenario:'panel-'+visibility,oldFirst,...report});await page.close();
   }
-  for(const action of ['toggle','save','delete','delete-cancel','file-retry']){
+  for(const action of ['toggle','save','delete','delete-cancel','file-retry','delete-during-file']){
     const page=await browser.newPage();
     await page.route('http://127.0.0.1:8789/fixture',r=>r.fulfill({contentType:'text/html',body:html}));
     await page.goto('http://127.0.0.1:8789/fixture');await page.evaluate(setup);
@@ -232,6 +232,17 @@ const compose = () => {
         const last=requests.at(-1);
         if(!last.path.includes('&file='))throw Error('cancelled deletion retired current links');
         last.resolve(content('linked'));await flush();
+        return {...snapshot(),switchOrdinal,mutationRequests:mutationsAfter(switchOrdinal)};
+      }
+      if(action==='delete-during-file'){
+        cancelSkillForm();
+        document.querySelector('.skill-linked-file').click();
+        const file=requests.at(-1);
+        const pending=deleteCurrentSkill();
+        file.resolve(content('linked'));await flush();
+        confirmations.at(-1)(true);await flush();
+        requests.at(-1).resolve({ok:true});await flush();
+        requests.at(-1).resolve({runtime_scope:'profile',skills:[]});await pending;
         return {...snapshot(),switchOrdinal,mutationRequests:mutationsAfter(switchOrdinal)};
       }
       if(action==='file-retry'){

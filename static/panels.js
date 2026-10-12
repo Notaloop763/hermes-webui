@@ -5477,6 +5477,7 @@ function toggleSkillForm(){ openSkillCreate(); }
 async function deleteCurrentSkill() {
   if (!_currentSkillDetail) return;
   const request = ++_skillDeleteRequest;
+  _skillFileRequest++; // a file read landing mid-delete would retire this delete's owner
   const owner = _skillDetailOwner();
   const owns = () => request === _skillDeleteRequest && _ownsSkillDetail(owner);
   const name = _currentSkillDetail.name;
