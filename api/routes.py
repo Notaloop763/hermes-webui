@@ -17062,6 +17062,24 @@ def handle_post(handler, parsed) -> bool:
                             # Keep the cached session equal to its sidecar.
                             reasoning_session.reasoning_effort = previous_effort
                             raise
+                        # A retag after the check could have been persisted with
+                        # this pick. Recheck the owner of what was just saved; if
+                        # the request no longer owns the chat, undo and refuse.
+                        with LOCK:
+                            saved_profile = getattr(reasoning_session, "profile", None)
+                        if not _session_visible_to_active_profile(saved_profile, handler):
+                            reasoning_session.reasoning_effort = previous_effort
+                            try:
+                                reasoning_session.save(touch_updated_at=False)
+                            except Exception:
+                                reasoning_session.reasoning_effort = normalized_effort
+                                logger.warning(
+                                    "reasoning effort rollback save failed for %s",
+                                    session_id, exc_info=True,
+                                )
+                            return _session_profile_mismatch_response(
+                                handler, session_id, saved_profile
+                            )
                         try:
                             from api.profiles import get_hermes_home_for_profile
 

@@ -779,35 +779,82 @@ def test_reasoning_handler_refuses_chat_retagged_to_another_profile_before_lock(
     assert _load_disk_session(session_dir, sid).get("reasoning_effort") is None
 
 
-def test_reasoning_handler_writes_checked_profile_when_retagged_after_check(
+def _retag_on_visibility_call(monkeypatch, session, call_number):
+    """Retag ``session`` to ``beta`` right after the Nth lock-held owner check
+    (1 = the check before the save, 2 = the recheck after it), as a
+    concurrent chat start would.
+    """
+    # The pre-routing guard passed; only the lock-held checks are observed here.
+    monkeypatch.setattr(
+        routes, "_session_id_visible_to_request_profile", lambda *a, **kw: True,
+    )
+    real_visible = routes._session_visible_to_active_profile
+    calls = []
+
+    def visible_then_retag(profile, handler=None):
+        ok = real_visible(profile, handler)
+        calls.append(profile)
+        if len(calls) == call_number:
+            # The production retag producer used by chat start and /goal.
+            assert routes._retag_empty_session_profile(session, "beta")[1] == "retagged"
+        return ok
+
+    monkeypatch.setattr(routes, "_session_visible_to_active_profile", visible_then_retag)
+    return calls
+
+
+def _seed_empty_alpha_session(session_dir, sid):
+    session = _seed_stale_session(session_dir, sid, title="t", draft={"text": ""})
+    session.profile = "alpha"
+    session.messages = []  # retag only applies to empty chats
+    session.reasoning_effort = "low"
+    session.save()
+    return session
+
+
+def test_reasoning_handler_refuses_chat_retagged_between_check_and_save(
     tmp_path, monkeypatch,
 ):
-    """A retag after the lock-held owner check cannot redirect the profile
-    default write: it goes to the profile that was checked.
+    """A retag after the lock-held owner check but before the save is caught
+    by the recheck after the save: the pick is undone on the chat, no profile
+    default is written, and the request gets the mismatch response.
     """
     session_dir = _isolate_session_store(tmp_path, monkeypatch)
     sid = "retag-reasoning-2"
     monkeypatch.setattr(routes, "_get_active_profile_name", lambda: "alpha")
     captured = _capture_post(monkeypatch, {"effort": "high", "session_id": sid})
     writes = _reasoning_profile_writes(monkeypatch)
-
-    session = _seed_stale_session(session_dir, sid, title="t", draft={"text": ""})
-    session.profile = "alpha"
-    session.messages = []  # retag only applies to empty chats
-    session.save()
+    session = _seed_empty_alpha_session(session_dir, sid)
     monkeypatch.setattr(routes, "_get_or_materialize_session", lambda value: session)
-    # The pre-routing guard passed; only the lock-held check is observed here.
-    monkeypatch.setattr(
-        routes, "_session_id_visible_to_request_profile", lambda *a, **kw: True,
+    _retag_on_visibility_call(monkeypatch, session, 1)
+
+    result = routes.handle_post(
+        _FakeHandler(b"{}"), SimpleNamespace(path="/api/reasoning"),
     )
-    real_visible = routes._session_visible_to_active_profile
 
-    def visible_then_retag(profile, handler=None):
-        ok = real_visible(profile, handler)
-        session.profile = "beta"  # chat start retags right after the check
-        return ok
+    assert result is True
+    assert captured["status"] == 409, f"expected 409, got {captured}"
+    assert writes == []
+    assert session.reasoning_effort == "low"
+    on_disk = _load_disk_session(session_dir, sid)
+    assert on_disk["reasoning_effort"] == "low"
+    assert on_disk["profile"] == "beta"
 
-    monkeypatch.setattr(routes, "_session_visible_to_active_profile", visible_then_retag)
+
+def test_reasoning_handler_writes_checked_profile_when_retagged_after_recheck(
+    tmp_path, monkeypatch,
+):
+    """A retag after the post-save recheck comes after the pick completed; it
+    cannot redirect the profile default write away from the checked profile.
+    """
+    session_dir = _isolate_session_store(tmp_path, monkeypatch)
+    sid = "retag-reasoning-3"
+    monkeypatch.setattr(routes, "_get_active_profile_name", lambda: "alpha")
+    captured = _capture_post(monkeypatch, {"effort": "high", "session_id": sid})
+    writes = _reasoning_profile_writes(monkeypatch)
+    session = _seed_empty_alpha_session(session_dir, sid)
+    monkeypatch.setattr(routes, "_get_or_materialize_session", lambda value: session)
+    calls = _retag_on_visibility_call(monkeypatch, session, 2)
 
     result = routes.handle_post(
         _FakeHandler(b"{}"), SimpleNamespace(path="/api/reasoning"),
@@ -815,8 +862,9 @@ def test_reasoning_handler_writes_checked_profile_when_retagged_after_check(
 
     assert result is True
     assert captured["status"] == 200, f"expected 200, got {captured}"
+    assert calls == ["alpha", "alpha"]
     assert writes == [("high", "home:alpha")]
-    assert session.reasoning_effort == "high"
+    assert _load_disk_session(session_dir, sid)["reasoning_effort"] == "high"
 
 
 # ---------------------------------------------------------------------------
