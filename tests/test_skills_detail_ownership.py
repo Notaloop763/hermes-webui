@@ -8,7 +8,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 
 
-# All 132 browser schedules run in one item. Allow the bounded 180-second
+# All 133 browser schedules run in one item. Allow the bounded 180-second
 # controller to finish (or report its own timeout) under CI's --timeout=60.
 @pytest.mark.timeout(240)
 def test_production_skills_detail_and_mutation_ownership():
@@ -23,12 +23,12 @@ def test_production_skills_detail_and_mutation_ownership():
                           capture_output=True, text=True, timeout=180)
     assert proc.returncode == 0, proc.stderr
     reports = json.loads(proc.stdout)
-    assert len(reports) == 132
+    assert len(reports) == 133
     for report in reports:
         if 'happy' in report:
             assert report['editing'] is report['pre'] is None, report
             assert report['profile'] == 'B', report
-            expected_requests = [] if report['happy'] == 'delete-cancel' else [
+            expected_requests = [] if report['happy'] in ('delete-cancel', 'file-retry') else [
                 {'ordinal': report['switchOrdinal'] + 3, 'path': '/api/skills/' + report['happy'],
                  'profile': 'B'}
             ]
@@ -43,6 +43,10 @@ def test_production_skills_detail_and_mutation_ownership():
             elif report['happy'] == 'delete-cancel':
                 assert report['mode'] == 'read', report
                 assert 'linked private content' in report['body'], report
+            elif report['happy'] == 'file-retry':
+                assert ['status', 'skill_file_load_failednetwork'] in report['events'], report
+                assert 'linked private content' in report['body'], report
+                assert 'skill-file-back' in report['body'], report
             else:
                 assert report['mode'] == 'empty', report
                 assert report['detail'] is None, report

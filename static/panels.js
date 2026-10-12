@@ -5292,12 +5292,19 @@ async function openSkill(name, el) {
   } catch(e) { if (_ownsSkillDetail(owner)) setStatus(t('skill_load_failed') + e.message); }
 }
 
+// The displayed view keeps its owner until a file read lands, so a failed read
+// leaves its linked files clickable; this counter orders reads issued from it.
+let _skillFileRequest = 0;
+
 async function openSkillFile(skillName, filePath) {
-  _skillDetailRequest++;
-  const owner = _skillDetailOwner();
+  const request = ++_skillFileRequest;
+  const viewOwner = _skillDetailOwner();
+  const owns = () => request === _skillFileRequest && _ownsSkillDetail(viewOwner);
   try {
     const data = await api(`/api/skills/content?name=${encodeURIComponent(skillName)}&file=${encodeURIComponent(filePath)}`, {timeoutToast: false, retries: 0});
-    if (!_ownsSkillDetail(owner)) return;
+    if (!owns()) return;
+    _skillDetailRequest++;
+    const owner = _skillDetailOwner();
     if (data && data.error) {
       _renderSkillError(skillName, data.error);
       setStatus(t('skill_file_load_failed') + data.error);
@@ -5336,7 +5343,7 @@ async function openSkillFile(skillName, filePath) {
     else requestAnimationFrame(() => {
       if (_ownsSkillDetail(owner) && typeof highlightCode === 'function') highlightCode(body);
     });
-  } catch(e) { if (_ownsSkillDetail(owner)) setStatus(t('skill_file_load_failed') + e.message); }
+  } catch(e) { if (owns()) setStatus(t('skill_file_load_failed') + e.message); }
 }
 
 function editCurrentSkill() {

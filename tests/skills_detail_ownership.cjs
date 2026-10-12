@@ -214,7 +214,7 @@ const compose = () => {
     },{visibility,oldFirst});
     reports.push({scenario:'panel-'+visibility,oldFirst,...report});await page.close();
   }
-  for(const action of ['toggle','save','delete','delete-cancel']){
+  for(const action of ['toggle','save','delete','delete-cancel','file-retry']){
     const page=await browser.newPage();
     await page.route('http://127.0.0.1:8789/fixture',r=>r.fulfill({contentType:'text/html',body:html}));
     await page.goto('http://127.0.0.1:8789/fixture');await page.evaluate(setup);
@@ -232,6 +232,18 @@ const compose = () => {
         const last=requests.at(-1);
         if(!last.path.includes('&file='))throw Error('cancelled deletion retired current links');
         last.resolve(content('linked'));await flush();
+        return {...snapshot(),switchOrdinal,mutationRequests:mutationsAfter(switchOrdinal)};
+      }
+      if(action==='file-retry'){
+        cancelSkillForm();
+        document.querySelector('.skill-linked-file').click();
+        const failed=requests.at(-1);
+        if(!failed.path.includes('&file='))throw Error('linked file did not request');
+        failed.reject(Error('network'));await flush();
+        document.querySelector('.skill-linked-file').click();
+        const retry=requests.at(-1);
+        if(retry===failed)throw Error('failed file read retired current links');
+        retry.resolve(content('linked'));await flush();
         return {...snapshot(),switchOrdinal,mutationRequests:mutationsAfter(switchOrdinal)};
       }
       const pending=action==='toggle'?toggleSkill('same',false):action==='save'?saveSkillForm():deleteCurrentSkill();
