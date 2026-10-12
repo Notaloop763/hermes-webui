@@ -722,6 +722,103 @@ def test_reasoning_handler_does_not_restamp_fork_as_webui(tmp_path, monkeypatch)
     _assert_fork_identity_survived(on_disk, sid, context="reasoning")
 
 
+def _reasoning_profile_writes(monkeypatch):
+    writes = []
+    monkeypatch.setattr(
+        routes, "write_reasoning_effort",
+        lambda effort, profile_home=None: writes.append((effort, str(profile_home))) or effort,
+    )
+    monkeypatch.setattr(
+        routes, "get_reasoning_status",
+        lambda **kw: {"reasoning_effort": kw.get("effort_override")},
+    )
+    monkeypatch.setattr(
+        routes, "get_hermes_home_for_profile",
+        lambda name: f"home:{name}", raising=False,
+    )
+    from api import profiles as _profiles_mod
+
+    monkeypatch.setattr(
+        _profiles_mod, "get_hermes_home_for_profile", lambda name: f"home:{name}",
+    )
+    return writes
+
+
+def test_reasoning_handler_refuses_chat_retagged_to_another_profile_before_lock(
+    tmp_path, monkeypatch,
+):
+    """The pre-routing visibility guard runs before the session lock; chat
+    start can retag an empty chat to another profile in between. The
+    lock-held owner check must refuse it rather than write that profile's
+    default or the chat.
+    """
+    session_dir = _isolate_session_store(tmp_path, monkeypatch)
+    sid = "retag-reasoning-1"
+    monkeypatch.setattr(routes, "_get_active_profile_name", lambda: "alpha")
+    captured = _capture_post(monkeypatch, {"effort": "high", "session_id": sid})
+    writes = _reasoning_profile_writes(monkeypatch)
+
+    stale = _seed_stale_session(session_dir, sid, title="t", draft={"text": ""})
+    stale.profile = "alpha"
+    stale.messages = []  # retag only applies to empty chats
+    stale.save()
+    retagged = _make_newer_session(session_dir, sid, title="t", draft={"text": ""})
+    retagged.profile = "beta"
+    retagged.messages = []
+    monkeypatch.setattr(routes, "_get_or_materialize_session", lambda value: stale)
+    _install_swap_lock(monkeypatch, sid, swap_with=retagged)
+
+    result = routes.handle_post(
+        _FakeHandler(b"{}"), SimpleNamespace(path="/api/reasoning"),
+    )
+
+    assert result is True
+    assert captured["status"] == 409, f"expected 409, got {captured}"
+    assert writes == []
+    assert retagged.reasoning_effort is None
+    assert _load_disk_session(session_dir, sid).get("reasoning_effort") is None
+
+
+def test_reasoning_handler_writes_checked_profile_when_retagged_after_check(
+    tmp_path, monkeypatch,
+):
+    """A retag after the lock-held owner check cannot redirect the profile
+    default write: it goes to the profile that was checked.
+    """
+    session_dir = _isolate_session_store(tmp_path, monkeypatch)
+    sid = "retag-reasoning-2"
+    monkeypatch.setattr(routes, "_get_active_profile_name", lambda: "alpha")
+    captured = _capture_post(monkeypatch, {"effort": "high", "session_id": sid})
+    writes = _reasoning_profile_writes(monkeypatch)
+
+    session = _seed_stale_session(session_dir, sid, title="t", draft={"text": ""})
+    session.profile = "alpha"
+    session.messages = []  # retag only applies to empty chats
+    session.save()
+    monkeypatch.setattr(routes, "_get_or_materialize_session", lambda value: session)
+    # The pre-routing guard passed; only the lock-held check is observed here.
+    monkeypatch.setattr(
+        routes, "_session_id_visible_to_request_profile", lambda *a, **kw: True,
+    )
+    real_visible = routes._session_visible_to_active_profile
+
+    def visible_then_retag(profile, handler=None):
+        ok = real_visible(profile, handler)
+        session.profile = "beta"  # chat start retags right after the check
+        return ok
+
+    monkeypatch.setattr(routes, "_session_visible_to_active_profile", visible_then_retag)
+
+    result = routes.handle_post(
+        _FakeHandler(b"{}"), SimpleNamespace(path="/api/reasoning"),
+    )
+
+    assert result is True
+    assert captured["status"] == 200, f"expected 200, got {captured}"
+    assert writes == [("high", "home:alpha")]
+    assert session.reasoning_effort == "high"
+
+
 # ---------------------------------------------------------------------------
 # PR #7776 Finding 1: /api/session/move must re-run _profiles_match inside
 # the lock with the canonical session's profile, not the stale pre-lock one.

@@ -750,6 +750,14 @@ def test_reasoning_pick_writes_the_profile_its_readers_use(
     handler = _DummyHandler(body, command="POST")
     with patch("api.routes._session_id_visible_to_request_profile", return_value=True):
         handle_post(handler, urlparse("/api/reasoning"))
+    if session_profile is not None and session_profile != active:
+        # The owner is rechecked under the session lock (the pre-routing guard
+        # is bypassed here): another profile's chat is refused, nothing written.
+        assert handler.status == 409
+        assert session.reasoning_effort == "low"
+        for name, path in files.items():
+            assert _yaml_effort(path) == before[name], name
+        return
     assert handler.status == 200
     assert handler.payload()["reasoning_effort"] == "xhigh"
 
@@ -781,8 +789,8 @@ def test_reasoning_pick_for_missing_profile_keeps_chat_and_writes_no_other_profi
     external = tmp_path / "external.yaml"
     external.write_text("agent:\n  reasoning_effort: medium\n")
     monkeypatch.setenv("HERMES_CONFIG_PATH", str(external))
-    if missing == "active":
-        monkeypatch.setattr(profiles, "_active_profile", "gone")
+    # A tab still on the deleted profile: the only request that owns its chat.
+    monkeypatch.setattr(profiles, "_active_profile", "gone")
     config.reload_config()
     body = {"effort": "xhigh", "model": "gpt-5", "provider": "openai"}
     if missing == "session":

@@ -17040,6 +17040,17 @@ def handle_post(handler, parsed) -> bool:
                     ):
                         reasoning_session = None
                     else:
+                        # The pre-routing visibility guard ran before this lock,
+                        # and chat start can retag an empty chat to another
+                        # profile under LOCK. Check the owner on this object and
+                        # write only that checked profile's default, so a later
+                        # retag cannot redirect the write.
+                        with LOCK:
+                            reasoning_profile = getattr(reasoning_session, "profile", None)
+                        if not _session_visible_to_active_profile(reasoning_profile, handler):
+                            return _session_profile_mismatch_response(
+                                handler, session_id, reasoning_profile
+                            )
                         if _reasoning_cli_meta:
                             _apply_cli_source_meta_to_session(reasoning_session, _reasoning_cli_meta)
                         previous_effort = getattr(reasoning_session, "reasoning_effort", None)
@@ -17055,10 +17066,7 @@ def handle_post(handler, parsed) -> bool:
                             from api.profiles import get_hermes_home_for_profile
 
                             write_reasoning_effort(
-                                effort,
-                                get_hermes_home_for_profile(
-                                    getattr(reasoning_session, "profile", None)
-                                ),
+                                effort, get_hermes_home_for_profile(reasoning_profile)
                             )
                         except Exception:
                             reasoning_session.reasoning_effort = previous_effort
