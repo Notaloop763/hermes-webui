@@ -781,6 +781,49 @@ def test_reasoning_pick_writes_the_profile_its_readers_use(
     )
 
 
+@pytest.mark.parametrize("config_location", ["root", "unset"])
+def test_reasoning_pick_refuses_chat_retagged_after_authorization(
+    isolated_reasoning_profiles, tmp_path, monkeypatch, config_location
+):
+    """An empty root chat passes the entry guard, then chat start retags it to
+    `work` before the pick takes the session lock. The lock-held owner check
+    refuses it: the chat keeps its effort and neither profile default changes.
+    """
+    root, work = isolated_reasoning_profiles
+    if config_location == "unset":
+        monkeypatch.delenv("HERMES_CONFIG_PATH", raising=False)
+    config.reload_config()
+    session = Session(
+        session_id="retag-chat", profile="default", model="gpt-5",
+        model_provider="openai", workspace=str(tmp_path), reasoning_effort="low",
+    )
+    session.save(touch_updated_at=False)
+    models.SESSIONS[session.session_id] = session
+    real_lock = routes._get_session_agent_lock
+
+    def lock_after_retag(sid):
+        # The production retag producer used by chat start and /goal.
+        _owner, result = routes._retag_empty_session_profile(session, "work")
+        assert result == "retagged"
+        session.save(touch_updated_at=False)
+        return real_lock(sid)
+
+    monkeypatch.setattr(routes, "_get_session_agent_lock", lock_after_retag)
+    handler = _DummyHandler(
+        # Neither profile's default nor the chat holds xhigh, so any write shows.
+        {"effort": "xhigh", "model": "gpt-5", "provider": "openai", "session_id": "retag-chat"},
+        command="POST",
+    )
+    handle_post(handler, urlparse("/api/reasoning"))
+
+    assert handler.status == 409
+    assert handler.payload()["code"] == "session_profile_mismatch"
+    assert session.reasoning_effort == "low"
+    assert Session.load("retag-chat").reasoning_effort == "low"
+    assert _yaml_effort(root / "config.yaml") == "low"
+    assert _yaml_effort(work / "config.yaml") == "high"
+
+
 @pytest.mark.parametrize("missing", ["session", "active"])
 def test_reasoning_pick_for_missing_profile_keeps_chat_and_writes_no_other_profile(
     isolated_reasoning_profiles, tmp_path, monkeypatch, missing
