@@ -17,6 +17,7 @@ import pytest
 import api.config as config
 import api.gateway_chat as gateway_chat
 import api.models as models
+import api.routes as routes
 from api import profiles
 from api.config import resolve_session_reasoning_effort
 from api.gateway_chat import _gateway_reasoning_effort_for_request
@@ -172,8 +173,10 @@ def _post_reasoning(body, session, *, save_error=None, visible=True, config_erro
         return False
 
     session.save = lambda touch_updated_at=True: save()
+    session.session_id = body.get("session_id")
     handler = _DummyHandler(body, command="POST")
     with (
+        patch.dict(routes.SESSIONS, {session.session_id: session}),
         patch(
             "api.routes._session_id_visible_to_request_profile",
             side_effect=(lambda *_a, **_k: True) if visible else reject,
@@ -288,7 +291,9 @@ def test_reasoning_post_read_only_session_keeps_master_profile_save():
 
 
 def test_reasoning_post_reports_this_sessions_effort_not_shared_default():
-    session = SimpleNamespace(reasoning_effort="high", save=lambda **_kw: None)
+    session = SimpleNamespace(
+        session_id="session-a", reasoning_effort="high", save=lambda **_kw: None
+    )
     captured = {}
 
     def status(**kwargs):
@@ -298,6 +303,7 @@ def test_reasoning_post_reports_this_sessions_effort_not_shared_default():
 
     handler = _DummyHandler({"effort": "low", "session_id": "session-a"}, command="POST")
     with (
+        patch.dict(routes.SESSIONS, {"session-a": session}),
         patch("api.routes._session_id_visible_to_request_profile", return_value=True),
         patch("api.routes._get_or_materialize_session", return_value=session),
         patch("api.routes.write_reasoning_effort"),
@@ -309,7 +315,7 @@ def test_reasoning_post_reports_this_sessions_effort_not_shared_default():
 
 
 def test_reasoning_post_failed_rollback_save_surfaces_profile_error():
-    session = SimpleNamespace(reasoning_effort="high")
+    session = SimpleNamespace(session_id="session-b", reasoning_effort="high")
     saves = []
 
     def save(touch_updated_at=True):
@@ -321,6 +327,7 @@ def test_reasoning_post_failed_rollback_save_surfaces_profile_error():
     handler = _DummyHandler({"effort": "low", "session_id": "session-b"}, command="POST")
     raised = None
     with (
+        patch.dict(routes.SESSIONS, {"session-b": session}),
         patch("api.routes._session_id_visible_to_request_profile", return_value=True),
         patch("api.routes._get_or_materialize_session", return_value=session),
         patch("api.routes.write_reasoning_effort", side_effect=PermissionError("config ro")),
@@ -413,7 +420,11 @@ def isolated_reasoning_profiles(tmp_path, monkeypatch):
     monkeypatch.setattr(profiles, "_DEFAULT_HERMES_HOME", root)
     monkeypatch.setattr(profiles, "_active_profile", "default")
     monkeypatch.setattr(profiles._tls, "profile", None, raising=False)
-    monkeypatch.setattr(models, "SESSIONS", OrderedDict())
+    # One cache for both modules, as in production: the reasoning POST
+    # re-resolves its session from api.routes.SESSIONS under the session lock.
+    sessions = OrderedDict()
+    monkeypatch.setattr(models, "SESSIONS", sessions)
+    monkeypatch.setattr(routes, "SESSIONS", sessions)
     session_dir = tmp_path / "sessions"
     session_dir.mkdir()
     monkeypatch.setattr(models, "SESSION_DIR", session_dir)

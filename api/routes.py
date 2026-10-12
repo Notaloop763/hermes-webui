@@ -16985,6 +16985,9 @@ def handle_post(handler, parsed) -> bool:
                 if session_id:
                     # Profile visibility for body session_id is enforced by
                     # _guard_request_session_visibility before routing.
+                    # #7738: this outside resolve only serves the 404 and
+                    # read-only contracts; the session that is mutated and
+                    # saved is re-resolved under the session lock below.
                     try:
                         reasoning_session = _get_or_materialize_session(session_id)
                     except KeyError:
@@ -17005,44 +17008,87 @@ def handle_post(handler, parsed) -> bool:
                     )
                 # One serialized step per session: overlapping POSTs for the same
                 # chat cannot interleave their session and profile writes. Only
-                # local file writes run under the lock; the capability lookup
+                # local reads and writes run under the lock; the capability lookup
                 # (possible network I/O) runs after it is released. The session
                 # is saved first so a failed save never changes only config.yaml;
                 # a failed profile write restores the session. The cached agent
                 # is rebuilt on its next turn because reasoning_config is part of
                 # the agent cache signature.
+                # #7776 Finding 2: capture the CLI source identity before the
+                # lock so the lock-held Session.load() cannot drop it on save.
+                _reasoning_cli_meta = _lookup_cli_session_metadata(session_id) or {}
                 with _get_session_agent_lock(session_id):
-                    previous_effort = getattr(reasoning_session, "reasoning_effort", None)
-                    reasoning_session.reasoning_effort = normalized_effort
-                    try:
-                        # A preference change is not conversation activity.
-                        reasoning_session.save(touch_updated_at=False)
-                    except Exception:
-                        # Keep the cached session equal to its sidecar.
-                        reasoning_session.reasoning_effort = previous_effort
-                        raise
-                    try:
-                        from api.profiles import get_hermes_home_for_profile
-
-                        write_reasoning_effort(
-                            effort,
-                            get_hermes_home_for_profile(
-                                getattr(reasoning_session, "profile", None)
-                            ),
-                        )
-                    except Exception:
-                        reasoning_session.reasoning_effort = previous_effort
+                    # #7738: eviction between the outside resolve and this lock
+                    # can drop that object from SESSIONS, so saving it could
+                    # overwrite a newer save. Re-resolve the canonical session
+                    # here, as /api/session/rename does.
+                    with LOCK:
+                        latest = SESSIONS.get(session_id)
+                        if latest is not None and str(getattr(latest, "session_id", "") or "") != session_id:
+                            SESSIONS.pop(session_id, None)
+                            latest = None
+                        elif latest is not None:
+                            SESSIONS.move_to_end(session_id)
+                    if latest is None:
+                        latest = Session.load(session_id)
+                        if latest is None:
+                            return bad(handler, "Session not found", 404)
+                    reasoning_session = _ensure_full_session_before_mutation(session_id, latest)
+                    if getattr(reasoning_session, "read_only", False) or (
+                        (getattr(reasoning_session, "source_tag", "") or getattr(reasoning_session, "raw_source", "") or "").strip().lower() == "subagent"
+                        or _is_subagent_child_session_id(session_id)
+                    ):
+                        reasoning_session = None
+                    else:
+                        if _reasoning_cli_meta:
+                            _apply_cli_source_meta_to_session(reasoning_session, _reasoning_cli_meta)
+                        previous_effort = getattr(reasoning_session, "reasoning_effort", None)
+                        reasoning_session.reasoning_effort = normalized_effort
                         try:
+                            # A preference change is not conversation activity.
                             reasoning_session.save(touch_updated_at=False)
                         except Exception:
-                            # The sidecar kept the new value; match it in memory
-                            # and surface the original profile-write error.
-                            reasoning_session.reasoning_effort = normalized_effort
-                            logger.warning(
-                                "reasoning effort rollback save failed for %s",
-                                session_id, exc_info=True,
+                            # Keep the cached session equal to its sidecar.
+                            reasoning_session.reasoning_effort = previous_effort
+                            raise
+                        try:
+                            from api.profiles import get_hermes_home_for_profile
+
+                            write_reasoning_effort(
+                                effort,
+                                get_hermes_home_for_profile(
+                                    getattr(reasoning_session, "profile", None)
+                                ),
                             )
-                        raise
+                        except Exception:
+                            reasoning_session.reasoning_effort = previous_effort
+                            try:
+                                reasoning_session.save(touch_updated_at=False)
+                            except Exception:
+                                # The sidecar kept the new value; match it in memory
+                                # and surface the original profile-write error.
+                                reasoning_session.reasoning_effort = normalized_effort
+                                logger.warning(
+                                    "reasoning effort rollback save failed for %s",
+                                    session_id, exc_info=True,
+                                )
+                            raise
+                        with LOCK:
+                            SESSIONS[session_id] = reasoning_session
+                            SESSIONS.move_to_end(session_id)
+                            _evict_sessions_over_cap()  # #4765: safe LRU eviction (never active/unsaved)
+                if reasoning_session is None:
+                    # Became read-only or a subagent child since the outside
+                    # check: same profile-default-only save as that check.
+                    return j(
+                        handler,
+                        set_reasoning_effort(
+                            effort,
+                            model_id=model_id,
+                            provider_id=provider_id,
+                            base_url=base_url,
+                        ),
+                    )
                 # Report this session's stored value, not the shared profile
                 # default another chat may have rewritten since the lock was released.
                 return j(

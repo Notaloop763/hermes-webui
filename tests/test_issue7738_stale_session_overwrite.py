@@ -539,6 +539,190 @@ def test_archive_handler_re_resolves_session_under_lock_to_avoid_stale_overwrite
 
 
 # ---------------------------------------------------------------------------
+# /api/reasoning with session_id — same-shape fix
+# ---------------------------------------------------------------------------
+
+
+def _stub_reasoning_profile_side_effects(monkeypatch):
+    """Keep the effort POST on the session save; the profile write and the
+    capability lookup are covered in tests/test_session_reasoning_effort.py.
+    """
+    monkeypatch.setattr(routes, "write_reasoning_effort", lambda effort, *_a: effort)
+    monkeypatch.setattr(
+        routes, "get_reasoning_status",
+        lambda **kw: {"reasoning_effort": kw.get("effort_override")},
+    )
+
+
+def test_reasoning_handler_re_resolves_session_under_lock_to_avoid_stale_overwrite(
+    tmp_path, monkeypatch,
+):
+    """#7738 same-shape regression: an effort pick must not save its stale
+    outside-resolved object over a newer draft autosave.
+    """
+    session_dir = _isolate_session_store(tmp_path, monkeypatch)
+    sid = "stale-reasoning-1"
+    captured = _capture_post(monkeypatch, {"effort": "high", "session_id": sid})
+    _stub_reasoning_profile_side_effects(monkeypatch)
+
+    stale = _seed_stale_session(
+        session_dir, sid, title="t", draft={"text": "old draft"},
+    )
+    newer = _make_newer_session(
+        session_dir, sid, title="t", draft={"text": "NEWER draft"},
+    )
+    newer.save()
+    monkeypatch.setattr(routes, "_get_or_materialize_session", lambda value: stale)
+    _install_swap_lock(monkeypatch, sid, swap_with=newer)
+
+    result = routes.handle_post(
+        _FakeHandler(b"{}"), SimpleNamespace(path="/api/reasoning"),
+    )
+
+    assert result is True
+    assert captured["status"] == 200, f"expected 200, got {captured}"
+    on_disk = _load_disk_session(session_dir, sid)
+    assert on_disk["reasoning_effort"] == "high"
+    assert on_disk["composer_draft"] == {"text": "NEWER draft"}, (
+        "the effort save must not revert a newer draft (issue #7738); "
+        f"got {on_disk['composer_draft']!r}"
+    )
+    assert SESSIONS[sid] is newer
+
+
+def test_reasoning_handler_falls_back_to_session_load_and_keeps_newer_turn(
+    tmp_path, monkeypatch,
+):
+    """#7738: with the session fully evicted, the effort pick reloads it from
+    disk under the lock, so a turn saved in the window is kept.
+    """
+    session_dir = _isolate_session_store(tmp_path, monkeypatch)
+    sid = "stale-reasoning-2"
+    captured = _capture_post(monkeypatch, {"effort": "low", "session_id": sid})
+    _stub_reasoning_profile_side_effects(monkeypatch)
+
+    stale = _seed_stale_session(session_dir, sid, title="t", draft={"text": ""})
+    newer = _make_newer_session(session_dir, sid, title="t", draft={"text": ""})
+    newer.messages = list(stale.messages) + [
+        {"role": "assistant", "content": "hello"},
+        {"role": "user", "content": "newer turn"},
+    ]
+    newer.save()
+    monkeypatch.setattr(routes, "_get_or_materialize_session", lambda value: stale)
+    _install_swap_lock(monkeypatch, sid, swap_with=None)
+
+    result = routes.handle_post(
+        _FakeHandler(b"{}"), SimpleNamespace(path="/api/reasoning"),
+    )
+
+    assert result is True
+    assert captured["status"] == 200, f"expected 200, got {captured}"
+    on_disk = _load_disk_session(session_dir, sid)
+    assert on_disk["reasoning_effort"] == "low"
+    assert len(on_disk["messages"]) == 3, (
+        "the effort save must not drop a turn saved after the outside "
+        f"resolve (issue #7738); got {len(on_disk['messages'])} messages"
+    )
+
+
+def test_reasoning_handler_profile_default_only_when_session_turns_read_only_under_lock(
+    tmp_path, monkeypatch,
+):
+    """#7738: the lock-held recheck keeps the outside check's contract — a
+    session that is read-only by the time the lock is taken gets only the
+    profile-default save, and its sidecar is left untouched.
+    """
+    session_dir = _isolate_session_store(tmp_path, monkeypatch)
+    sid = "stale-reasoning-ro"
+    captured = _capture_post(monkeypatch, {"effort": "high", "session_id": sid})
+    _stub_reasoning_profile_side_effects(monkeypatch)
+    profile_saves = []
+    monkeypatch.setattr(
+        routes, "set_reasoning_effort",
+        lambda effort, **_kw: profile_saves.append(effort) or {"reasoning_effort": effort},
+    )
+
+    stale = _seed_stale_session(session_dir, sid, title="t", draft={"text": "d"})
+    newer = _make_newer_session(session_dir, sid, title="t", draft={"text": "d"})
+    newer.read_only = True
+    monkeypatch.setattr(routes, "_get_or_materialize_session", lambda value: stale)
+    _install_swap_lock(monkeypatch, sid, swap_with=newer)
+
+    result = routes.handle_post(
+        _FakeHandler(b"{}"), SimpleNamespace(path="/api/reasoning"),
+    )
+
+    assert result is True
+    assert captured["status"] == 200, f"expected 200, got {captured}"
+    assert profile_saves == ["high"]
+    assert _load_disk_session(session_dir, sid).get("reasoning_effort") is None
+    assert newer.reasoning_effort is None
+
+
+def test_reasoning_handler_preserves_cli_source_identity_across_lock_reload(
+    tmp_path, monkeypatch,
+):
+    """#7776 Finding 2: the effort pick's lock-held Session.load(sid) must not
+    drop the CLI source identity of a materialized CLI/agent session.
+    """
+    from api import profiles as _profiles_mod
+
+    session_dir = _isolate_session_store(tmp_path, monkeypatch)
+    sid = "cli-source-reasoning-1"
+    monkeypatch.setattr(routes, "_get_active_profile_name", lambda: "alpha")
+    monkeypatch.setattr(
+        _profiles_mod, "get_active_profile_name", lambda: "alpha",
+    )
+    _seed_sidecar_without_source_meta(session_dir, sid, title="cli title")
+    cli_meta = {
+        "session_id": sid,
+        "title": "cli title",
+        "is_cli_session": True,
+        "source_tag": "hermes-cli",
+        "raw_source": "hermes-cli",
+        "session_source": "cli",
+        "source_label": "Hermes CLI",
+    }
+    monkeypatch.setattr(
+        routes, "_lookup_cli_session_metadata",
+        lambda value, *, all_profiles=False: dict(cli_meta),
+    )
+    captured = _capture_post(monkeypatch, {"effort": "high", "session_id": sid})
+    _stub_reasoning_profile_side_effects(monkeypatch)
+
+    result = routes.handle_post(
+        _FakeHandler(b"{}"), SimpleNamespace(path="/api/reasoning"),
+    )
+
+    assert result is True
+    assert captured["status"] == 200, f"expected 200, got {captured}"
+    on_disk = _load_disk_session(session_dir, sid)
+    assert on_disk["reasoning_effort"] == "high"
+    assert on_disk.get("is_cli_session") is True
+    assert on_disk.get("source_tag") == "hermes-cli"
+    assert on_disk.get("raw_source") == "hermes-cli"
+    assert on_disk.get("source_label") == "Hermes CLI"
+
+
+def test_reasoning_handler_does_not_restamp_fork_as_webui(tmp_path, monkeypatch):
+    """#7776 Finding 3: an effort pick on a WebUI fork keeps session_source='fork'."""
+    sid = "webui-fork-reasoning-1"
+    session_dir = _setup_fork_rename_scenario(tmp_path, monkeypatch, sid=sid)
+    captured = _capture_post(monkeypatch, {"effort": "high", "session_id": sid})
+    _stub_reasoning_profile_side_effects(monkeypatch)
+
+    result = routes.handle_post(
+        _FakeHandler(b"{}"), SimpleNamespace(path="/api/reasoning"),
+    )
+
+    assert result is True
+    assert captured["status"] == 200, f"expected 200, got {captured}"
+    on_disk = _load_disk_session(session_dir, sid)
+    assert on_disk["reasoning_effort"] == "high"
+    _assert_fork_identity_survived(on_disk, sid, context="reasoning")
+
+
+# ---------------------------------------------------------------------------
 # PR #7776 Finding 1: /api/session/move must re-run _profiles_match inside
 # the lock with the canonical session's profile, not the stale pre-lock one.
 # ---------------------------------------------------------------------------
