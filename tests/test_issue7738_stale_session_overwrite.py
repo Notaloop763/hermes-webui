@@ -31,6 +31,8 @@ import io
 import json
 from types import SimpleNamespace
 
+import pytest
+
 import api.models as models
 import api.routes as routes
 from api.models import SESSIONS, Session
@@ -1500,3 +1502,99 @@ def test_apply_cli_source_meta_never_overwrites_existing_fork():
     )
     assert session.is_cli_session is False
     assert session.source_tag is None
+
+
+# ---------------------------------------------------------------------------
+# /api/session/draft — must not undo an effort pick saved after eviction
+# ---------------------------------------------------------------------------
+
+
+class _PickThenResumeLock:
+    """Proxy for the draft's session lock. Before the draft takes it, the
+    session is evicted, a newer turn lands on disk and a real effort pick is
+    saved through ``/api/reasoning``; ``evict_after_pick`` then drops the
+    pick's object too, so the draft must reload from disk.
+    """
+
+    def __init__(self, inner, run_pick, evict_after_pick):
+        self._inner = inner
+        self._run_pick = run_pick
+        self._evict_after_pick = evict_after_pick
+
+    def acquire(self, *args, **kwargs):
+        self._run_pick(self._evict_after_pick)
+        return self._inner.acquire(*args, **kwargs)
+
+    def release(self):
+        self._inner.release()
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.release()
+
+
+@pytest.mark.parametrize("evict_after_pick", [False, True], ids=["pick-resident", "fully-evicted"])
+def test_draft_autosave_does_not_undo_effort_pick_saved_after_eviction(
+    tmp_path, monkeypatch, evict_after_pick,
+):
+    """#7738 same-shape: a draft resolved before eviction must not save its
+    stale object over a later effort pick and turn. The effort, the draft
+    and every message must survive a cold reload.
+    """
+    session_dir = _isolate_session_store(tmp_path, monkeypatch)
+    sid = "stale-draft-effort"
+    _stub_reasoning_profile_side_effects(monkeypatch)
+
+    stale = _seed_stale_session(session_dir, sid, title="t", draft={"text": "old draft"})
+    stale.reasoning_effort = "low"
+    stale.save()
+
+    bodies = {"body": {"session_id": sid, "text": "new draft"}}
+    captured = _capture_post(monkeypatch, None)
+    monkeypatch.setattr(routes, "read_body", lambda handler: bodies["body"])
+    real_lock_factory = routes._get_session_agent_lock
+    fired = []
+
+    def _run_pick(evict):
+        if fired:
+            return
+        fired.append(True)
+        # Count-cap eviction, then a turn saved by another writer.
+        SESSIONS.pop(sid, None)
+        turn = Session.load(sid)
+        turn.messages = list(turn.messages) + [
+            {"role": "assistant", "content": "hello"},
+            {"role": "user", "content": "newer turn"},
+        ]
+        turn.save()
+        draft_body = bodies["body"]
+        bodies["body"] = {"effort": "xhigh", "session_id": sid}
+        monkeypatch.setattr(routes, "_get_session_agent_lock", real_lock_factory)
+        routes.handle_post(_FakeHandler(b"{}"), SimpleNamespace(path="/api/reasoning"))
+        assert captured["status"] == 200, f"effort pick failed: {captured}"
+        bodies["body"] = draft_body
+        if evict:
+            SESSIONS.pop(sid, None)
+
+    monkeypatch.setattr(
+        routes, "_get_session_agent_lock",
+        lambda value: _PickThenResumeLock(real_lock_factory(value), _run_pick, evict_after_pick),
+    )
+
+    handler = _FakeHandler(b"{}")
+    handler.command = "POST"
+    result = routes.handle_post(handler, SimpleNamespace(path="/api/session/draft"))
+
+    assert result is True
+    assert fired, "the effort pick must run inside the draft's window"
+    assert captured["status"] == 200, f"expected 200, got {captured}"
+    SESSIONS.clear()
+    cold = Session.load(sid)
+    assert cold.reasoning_effort == "xhigh", (
+        f"the draft save undid the accepted effort pick; got {cold.reasoning_effort!r}"
+    )
+    assert cold.composer_draft == {"text": "new draft"}
+    assert len(cold.messages) == 3, f"got {len(cold.messages)} messages"

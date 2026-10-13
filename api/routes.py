@@ -17365,6 +17365,25 @@ def handle_post(handler, parsed) -> bool:
         unchanged = False
         with _get_session_agent_lock(sid):
             _draft_mark("acquired_lock")
+            # #7738: eviction between the outside resolve and this lock can
+            # drop that object from SESSIONS, so saving it could overwrite a
+            # newer save (e.g. an effort pick). Re-resolve the canonical
+            # session here, as /api/reasoning does.
+            with LOCK:
+                latest = SESSIONS.get(sid)
+                if latest is not None and str(getattr(latest, "session_id", "") or "") != sid:
+                    SESSIONS.pop(sid, None)
+                    latest = None
+                elif latest is not None:
+                    SESSIONS.move_to_end(sid)
+            if latest is None:
+                latest = Session.load(sid)
+                if latest is None:
+                    return bad(handler, "Session not found", 404)
+            try:
+                s = _ensure_full_session_before_mutation(sid, latest)
+            except KeyError:
+                return bad(handler, "Session not found", 404)
             current_draft = dict(getattr(s, "composer_draft", {}) or {})
             next_draft = dict(current_draft)
             if text is not None:
