@@ -4381,6 +4381,12 @@ def _ensure_full_session_before_mutation(sid: str, session):
     return full_session
 
 
+# Ids deleted by /api/session/delete in this process, recorded under the
+# session lock so a writer that was waiting on that lock cannot save the
+# empty-shell fallback back to disk.
+_DELETED_SESSION_IDS: set[str] = set()
+
+
 def _resolve_session_under_lock(sid: str, outside=None):
     """Return the canonical full session for a save; caller holds the session lock.
 
@@ -4389,7 +4395,8 @@ def _resolve_session_under_lock(sid: str, outside=None):
     it could overwrite a newer save (e.g. an effort pick). Re-resolve from
     SESSIONS or disk instead. Returns None when the session is gone. A
     never-persisted New Conversation shell has no sidecar to clobber, so the
-    outside object is kept when it is that shell (same id, no messages).
+    outside object is kept when it is that shell (same id, no messages) and
+    /api/session/delete has not removed it.
     Raises KeyError if a metadata-only object cannot be upgraded.
     """
     with LOCK:
@@ -4407,6 +4414,7 @@ def _resolve_session_under_lock(sid: str, outside=None):
             and str(getattr(outside, "session_id", "") or "") == sid
             and not (getattr(outside, "messages", None) or [])
             and not getattr(outside, "_loaded_metadata_only", False)
+            and sid not in _DELETED_SESSION_IDS
         ):
             return outside
         return None
@@ -17591,6 +17599,7 @@ def handle_post(handler, parsed) -> bool:
         try:
             with LOCK:
                 SESSIONS.pop(sid, None)
+                _DELETED_SESSION_IDS.add(sid)
             try:
                 p = (SESSION_DIR / f"{sid}.json").resolve()
                 p.relative_to(SESSION_DIR.resolve())

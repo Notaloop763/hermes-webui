@@ -1692,7 +1692,7 @@ def test_session_writer_does_not_undo_effort_pick_saved_after_eviction(
     effort pick saves XHigh, then the writer resumes. A cold reload must
     keep XHigh and the writer's own change.
     """
-    session_dir = _isolate_session_store(tmp_path, monkeypatch)
+    _isolate_session_store(tmp_path, monkeypatch)
     sid = "stale-writer-effort"
     _stub_reasoning_profile_side_effects(monkeypatch)
     _stub_post_lock_side_effects(monkeypatch)
@@ -1811,3 +1811,64 @@ def test_shell_fallback_refuses_object_with_messages(tmp_path, monkeypatch):
         messages=[{"role": "user", "content": "hi"}],
     )
     assert routes._resolve_session_under_lock(sid, outside) is None
+
+
+@pytest.mark.parametrize("lane", ["draft", "reasoning"])
+def test_empty_session_deleted_before_lock_is_not_resurrected(tmp_path, monkeypatch, lane):
+    """A delete in the window tombstones the chat; the empty-shell fallback
+    must not save the outside object back.
+    """
+    session_dir = _isolate_session_store(tmp_path, monkeypatch)
+    sid = "deleted-in-window"
+    _stub_reasoning_profile_side_effects(monkeypatch)
+    monkeypatch.setattr(routes, "_lookup_cli_session_metadata", lambda value: {})
+    outside = Session(session_id=sid, title="Untitled", workspace=str(tmp_path),
+                      composer_draft={"text": "draft"})
+    outside.save()
+    SESSIONS[sid] = outside
+
+    monkeypatch.setattr(routes, "_DELETED_SESSION_IDS", set())
+    # A tombstone that dropped this id (it is capped) must not matter.
+    monkeypatch.setattr(models, "_record_webui_deleted_session_tombstone", lambda value: None)
+    monkeypatch.setattr(routes, "_record_webui_deleted_session_tombstone", lambda value: None)
+    delete_captured = {}
+
+    def _delete_in_window():
+        monkeypatch.setattr(routes, "_get_session_agent_lock", real_lock_factory)
+        monkeypatch.setattr(routes, "read_body", lambda handler: {"session_id": sid})
+        monkeypatch.setattr(routes, "_lookup_cli_session_metadata", lambda value: {})
+        monkeypatch.setattr(routes, "delete_cli_session", lambda value: True, raising=False)
+        import api.models as _m
+        monkeypatch.setattr(_m, "delete_cli_session", lambda value: True)
+        monkeypatch.setattr(routes, "_publish_session_list_changed", lambda *a, **kw: None)
+        routes.handle_post(_FakeHandler(b"{}"), SimpleNamespace(path="/api/session/delete"))
+        delete_captured.update(captured)
+        monkeypatch.setattr(routes, "read_body", lambda handler: body)
+
+    if lane == "draft":
+        body = {"session_id": sid, "text": "late keystroke"}
+        path = "/api/session/draft"
+    else:
+        body = {"effort": "high", "session_id": sid}
+        path = "/api/reasoning"
+    captured = _capture_post(monkeypatch, body)
+    real_lock_factory = routes._get_session_agent_lock
+
+    class _DeleteLock(_DropLock):
+        def acquire(self, *args, **kwargs):
+            _delete_in_window()
+            return self._inner.acquire(*args, **kwargs)
+
+    monkeypatch.setattr(
+        routes, "_get_session_agent_lock",
+        lambda value: _DeleteLock(real_lock_factory(value), value),
+    )
+
+    handler = _FakeHandler(b"{}")
+    handler.command = "POST"
+    routes.handle_post(handler, SimpleNamespace(path=path))
+
+    assert delete_captured.get("status") == 200, f"delete failed: {delete_captured}"
+    assert captured["status"] == 404, f"expected 404, got {captured}"
+    assert sid not in SESSIONS
+    assert not (session_dir / f"{sid}.json").exists()
