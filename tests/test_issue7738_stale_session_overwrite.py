@@ -1640,3 +1640,174 @@ def test_draft_save_publishes_over_copy_cached_by_get_in_window(tmp_path, monkey
     assert cold.composer_draft == {"text": "new draft"}, (
         f"a later effort pick saved the cached old draft back; got {cold.composer_draft!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Every other session writer — must not undo an effort pick saved after eviction
+# ---------------------------------------------------------------------------
+
+
+_ANCHOR_SCENE = {
+    "version": "activity_scene_v1",
+    "mode": "compact_worklog",
+    "activity_rows": [{"row_id": "tool-1", "role": "tool"}],
+    "final_answer": "hello",
+}
+
+
+def _seed_writer(session):
+    session.personality = "old"
+    session.pinned = True
+
+
+# (path, body, assertion on the cold-reloaded session)
+_WRITERS = [
+    ("/api/session/update", {"model": "newer-model"},
+     lambda s: s.model == "newer-model"),
+    ("/api/session/toolsets", {"toolsets": ["web"]},
+     lambda s: s.enabled_toolsets == ["web"]),
+    ("/api/personality/set", {"name": ""},
+     lambda s: s.personality is None),
+    ("/api/session/clear", {},
+     lambda s: s.messages == []),
+    ("/api/session/truncate", {"keep_count": 1},
+     lambda s: len(s.messages) == 1),
+    ("/api/session/pin", {"pinned": False},
+     lambda s: s.pinned is False),
+    ("/api/session/pin", {"pinned": True},
+     lambda s: s.pinned is True),
+    ("/api/session/anchor-scene", {"message_index": 1, "scene": _ANCHOR_SCENE},
+     lambda s: len(s.anchor_activity_scenes or {}) == 1),
+]
+
+
+@pytest.mark.parametrize(
+    "path,extra,check", _WRITERS,
+    ids=["update", "toolsets", "personality", "clear", "truncate", "unpin", "pin", "anchor-scene"],
+)
+def test_session_writer_does_not_undo_effort_pick_saved_after_eviction(
+    tmp_path, monkeypatch, path, extra, check,
+):
+    """#7738 class: each writer resolves Low, the session is evicted, an
+    effort pick saves XHigh, then the writer resumes. A cold reload must
+    keep XHigh and the writer's own change.
+    """
+    session_dir = _isolate_session_store(tmp_path, monkeypatch)
+    sid = "stale-writer-effort"
+    _stub_reasoning_profile_side_effects(monkeypatch)
+    _stub_post_lock_side_effects(monkeypatch)
+    monkeypatch.setattr(routes, "resolve_trusted_workspace", lambda p, profile=None: p)
+    monkeypatch.setattr(routes, "set_last_workspace", lambda *a, **kw: None)
+    monkeypatch.setattr(routes, "_resolve_context_length_for_session_model", lambda *a: 0)
+    monkeypatch.setattr(routes, "_lookup_cli_session_metadata", lambda value: {})
+    import api.config as config
+    monkeypatch.setattr(config, "_evict_session_agent", lambda *a, **kw: None)
+    monkeypatch.setattr(routes, "list_profiles_api", lambda: [])
+    if "pinned" in extra and extra["pinned"]:
+        monkeypatch.setattr(routes, "all_sessions", lambda: [])
+
+    stale = Session(
+        session_id=sid,
+        title="t",
+        workspace=str(tmp_path),
+        model="old-model",
+        messages=[
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello"},
+        ],
+        reasoning_effort="low",
+    )
+    _seed_writer(stale)
+    if path == "/api/session/pin" and extra["pinned"]:
+        stale.pinned = False
+    stale.save()
+    SESSIONS[sid] = stale
+
+    bodies = {"body": {"session_id": sid, **extra}}
+    captured = _capture_post(monkeypatch, None)
+    monkeypatch.setattr(routes, "read_body", lambda handler: bodies["body"])
+    real_lock_factory = routes._get_session_agent_lock
+    fired = []
+
+    def _run_pick(_evict):
+        if fired:
+            return
+        fired.append(True)
+        SESSIONS.pop(sid, None)  # count-cap eviction
+        writer_body = bodies["body"]
+        bodies["body"] = {"effort": "xhigh", "session_id": sid}
+        monkeypatch.setattr(routes, "_get_session_agent_lock", real_lock_factory)
+        routes.handle_post(_FakeHandler(b"{}"), SimpleNamespace(path="/api/reasoning"))
+        assert captured["status"] == 200, f"effort pick failed: {captured}"
+        bodies["body"] = writer_body
+
+    monkeypatch.setattr(
+        routes, "_get_session_agent_lock",
+        lambda value: _PickThenResumeLock(real_lock_factory(value), _run_pick, False),
+    )
+
+    handler = _FakeHandler(b"{}")
+    handler.command = "POST"
+    result = routes.handle_post(handler, SimpleNamespace(path=path))
+
+    assert result is True
+    assert fired, "the effort pick must run inside the writer's window"
+    assert captured["status"] == 200, f"expected 200, got {captured}"
+    SESSIONS.clear()
+    cold = Session.load(sid)
+    assert cold.reasoning_effort == "xhigh", (
+        f"{path} undid the accepted effort pick; got {cold.reasoning_effort!r}"
+    )
+    assert check(cold), f"{path} lost its own change"
+
+
+# ---------------------------------------------------------------------------
+# A never-persisted New Conversation shell evicted before the lock
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("lane", ["draft", "reasoning"])
+def test_unsaved_shell_evicted_before_lock_is_kept(tmp_path, monkeypatch, lane):
+    """A cache-only shell has no sidecar to clobber, so the handler keeps the
+    outside-resolved object instead of answering 404 and losing the chat.
+    """
+    session_dir = _isolate_session_store(tmp_path, monkeypatch)
+    sid = "unsaved-shell"
+    _stub_reasoning_profile_side_effects(monkeypatch)
+    monkeypatch.setattr(routes, "_lookup_cli_session_metadata", lambda value: {})
+    shell = Session(session_id=sid, title="Untitled", workspace=str(tmp_path))
+    SESSIONS[sid] = shell
+    assert not (session_dir / f"{sid}.json").exists()
+
+    if lane == "draft":
+        body = {"session_id": sid, "text": "first words"}
+        path = "/api/session/draft"
+    else:
+        body = {"effort": "high", "session_id": sid}
+        path = "/api/reasoning"
+    captured = _capture_post(monkeypatch, body)
+    _install_swap_lock(monkeypatch, sid, swap_with=None)  # evicted before the lock
+
+    handler = _FakeHandler(b"{}")
+    handler.command = "POST"
+    routes.handle_post(handler, SimpleNamespace(path=path))
+
+    assert captured["status"] == 200, f"expected 200, got {captured}"
+    assert SESSIONS.get(sid) is shell, "the shell must be republished to the cache"
+    cold = Session.load(sid)
+    assert cold is not None
+    if lane == "draft":
+        assert cold.composer_draft == {"text": "first words"}
+    else:
+        assert cold.reasoning_effort == "high"
+
+
+def test_shell_fallback_refuses_object_with_messages(tmp_path, monkeypatch):
+    """A gone session with messages is not a shell: keep the 404."""
+    _isolate_session_store(tmp_path, monkeypatch)
+    sid = "gone-with-messages"
+    outside = Session(
+        session_id=sid, title="t", workspace=str(tmp_path),
+        messages=[{"role": "user", "content": "hi"}],
+    )
+    assert routes._resolve_session_under_lock(sid, outside) is None

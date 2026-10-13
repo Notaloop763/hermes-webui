@@ -4381,6 +4381,46 @@ def _ensure_full_session_before_mutation(sid: str, session):
     return full_session
 
 
+def _resolve_session_under_lock(sid: str, outside=None):
+    """Return the canonical full session for a save; caller holds the session lock.
+
+    #7738: eviction between a handler's outside resolve and its
+    _get_session_agent_lock(sid) can drop that object from SESSIONS, so saving
+    it could overwrite a newer save (e.g. an effort pick). Re-resolve from
+    SESSIONS or disk instead. Returns None when the session is gone. A
+    never-persisted New Conversation shell has no sidecar to clobber, so the
+    outside object is kept when it is that shell (same id, no messages).
+    Raises KeyError if a metadata-only object cannot be upgraded.
+    """
+    with LOCK:
+        latest = SESSIONS.get(sid)
+        if latest is not None and str(getattr(latest, "session_id", "") or "") != sid:
+            SESSIONS.pop(sid, None)
+            latest = None
+        elif latest is not None:
+            SESSIONS.move_to_end(sid)
+    if latest is None:
+        latest = Session.load(sid)
+    if latest is None:
+        if (
+            outside is not None
+            and str(getattr(outside, "session_id", "") or "") == sid
+            and not (getattr(outside, "messages", None) or [])
+            and not getattr(outside, "_loaded_metadata_only", False)
+        ):
+            return outside
+        return None
+    return _ensure_full_session_before_mutation(sid, latest)
+
+
+def _publish_saved_session(sid: str, session) -> None:
+    """Publish a just-saved session so later writers don't trust a stale copy."""
+    with LOCK:
+        SESSIONS[sid] = session
+        SESSIONS.move_to_end(sid)
+        _evict_sessions_over_cap()  # #4765: safe LRU eviction (never active/unsaved)
+
+
 _ANCHOR_ACTIVITY_SCENE_MAX_BYTES = 256_000
 _ANCHOR_ACTIVITY_SCENE_MAX_ROWS = 1_000
 
@@ -5834,7 +5874,20 @@ def _handle_session_anchor_scene(handler, body):
                 "profile": _anchor_session_profile,
             }, status=409)
         return bad(handler, "Session not found", 404)
+    # #7776 Finding 2: capture CLI source identity before the lock so the
+    # lock-held reload cannot drop it on save.
+    _anchor_cli_meta = _lookup_cli_session_metadata(sid) or {}
     with _get_session_agent_lock(sid):
+        try:
+            s = _resolve_session_under_lock(sid, s)
+        except KeyError:
+            s = None
+        if s is None:
+            return bad(handler, "Session not found", 404)
+        if getattr(s, "read_only", False):
+            return bad(handler, "Read-only imported sessions cannot persist anchor scenes", 403)
+        if _anchor_cli_meta:
+            _apply_cli_source_meta_to_session(s, _anchor_cli_meta)
         idx, message = _find_anchor_scene_message(
             getattr(s, "messages", None) or [],
             message_index=message_index,
@@ -5865,6 +5918,7 @@ def _handle_session_anchor_scene(handler, body):
             records = dict(ordered[-256:])
         s.anchor_activity_scenes = records
         s.save(touch_updated_at=False, skip_index=True)
+        _publish_saved_session(sid, s)
     return j(handler, {"ok": True, "message_index": idx, "message_ref": ref})
 
 
@@ -17018,22 +17072,13 @@ def handle_post(handler, parsed) -> bool:
                 # lock so the lock-held Session.load() cannot drop it on save.
                 _reasoning_cli_meta = _lookup_cli_session_metadata(session_id) or {}
                 with _get_session_agent_lock(session_id):
-                    # #7738: eviction between the outside resolve and this lock
-                    # can drop that object from SESSIONS, so saving it could
-                    # overwrite a newer save. Re-resolve the canonical session
-                    # here, as /api/session/rename does.
-                    with LOCK:
-                        latest = SESSIONS.get(session_id)
-                        if latest is not None and str(getattr(latest, "session_id", "") or "") != session_id:
-                            SESSIONS.pop(session_id, None)
-                            latest = None
-                        elif latest is not None:
-                            SESSIONS.move_to_end(session_id)
-                    if latest is None:
-                        latest = Session.load(session_id)
-                        if latest is None:
-                            return bad(handler, "Session not found", 404)
-                    reasoning_session = _ensure_full_session_before_mutation(session_id, latest)
+                    # #7738: re-resolve the canonical session under the lock.
+                    try:
+                        reasoning_session = _resolve_session_under_lock(session_id, reasoning_session)
+                    except KeyError:
+                        reasoning_session = None
+                    if reasoning_session is None:
+                        return bad(handler, "Session not found", 404)
                     if getattr(reasoning_session, "read_only", False) or (
                         (getattr(reasoning_session, "source_tag", "") or getattr(reasoning_session, "raw_source", "") or "").strip().lower() == "subagent"
                         or _is_subagent_child_session_id(session_id)
@@ -17099,10 +17144,7 @@ def handle_post(handler, parsed) -> bool:
                                     session_id, exc_info=True,
                                 )
                             raise
-                        with LOCK:
-                            SESSIONS[session_id] = reasoning_session
-                            SESSIONS.move_to_end(session_id)
-                            _evict_sessions_over_cap()  # #4765: safe LRU eviction (never active/unsaved)
+                        _publish_saved_session(session_id, reasoning_session)
                 if reasoning_session is None:
                     # Became read-only or a subagent child since the outside
                     # check: same profile-default-only save as that check.
@@ -17280,8 +17322,15 @@ def handle_post(handler, parsed) -> bool:
             else:
                 prompt = str(value)
         with _get_session_agent_lock(sid):
+            try:
+                s = _resolve_session_under_lock(sid, s)
+            except KeyError:
+                s = None
+            if s is None:
+                return bad(handler, "Session not found", 404)
             s.personality = name if name else None
             s.save()
+            _publish_saved_session(sid, s)
         return j(handler, {"ok": True, "personality": s.personality, "prompt": prompt})
 
     if parsed.path == "/api/session/toolsets":
@@ -17307,8 +17356,15 @@ def handle_post(handler, parsed) -> bool:
         except KeyError:
             return bad(handler, "Session not found", 404)
         with _get_session_agent_lock(sid):
+            try:
+                s = _resolve_session_under_lock(sid, s)
+            except KeyError:
+                s = None
+            if s is None:
+                return bad(handler, "Session not found", 404)
             s.enabled_toolsets = toolsets
             s.save()
+            _publish_saved_session(sid, s)
         return j(handler, {"ok": True, "enabled_toolsets": s.enabled_toolsets})
 
     if parsed.path == "/api/session/draft":
@@ -17365,24 +17421,11 @@ def handle_post(handler, parsed) -> bool:
         unchanged = False
         with _get_session_agent_lock(sid):
             _draft_mark("acquired_lock")
-            # #7738: eviction between the outside resolve and this lock can
-            # drop that object from SESSIONS, so saving it could overwrite a
-            # newer save (e.g. an effort pick). Re-resolve the canonical
-            # session here, as /api/reasoning does.
-            with LOCK:
-                latest = SESSIONS.get(sid)
-                if latest is not None and str(getattr(latest, "session_id", "") or "") != sid:
-                    SESSIONS.pop(sid, None)
-                    latest = None
-                elif latest is not None:
-                    SESSIONS.move_to_end(sid)
-            if latest is None:
-                latest = Session.load(sid)
-                if latest is None:
-                    return bad(handler, "Session not found", 404)
             try:
-                s = _ensure_full_session_before_mutation(sid, latest)
+                s = _resolve_session_under_lock(sid, s)
             except KeyError:
+                s = None
+            if s is None:
                 return bad(handler, "Session not found", 404)
             current_draft = dict(getattr(s, "composer_draft", {}) or {})
             next_draft = dict(current_draft)
@@ -17405,10 +17448,7 @@ def handle_post(handler, parsed) -> bool:
                 saved_draft = s.composer_draft
                 # A GET in the window may have cached an older copy; publish
                 # the saved object so later writers don't trust that copy.
-                with LOCK:
-                    SESSIONS[sid] = s
-                    SESSIONS.move_to_end(sid)
-                    _evict_sessions_over_cap()  # #4765: safe LRU eviction (never active/unsaved)
+                _publish_saved_session(sid, s)
         _draft_mark("released_lock")
         payload = {"ok": True, "draft": saved_draft}
         if unchanged:
@@ -17441,12 +17481,25 @@ def handle_post(handler, parsed) -> bool:
             return bad(handler, "Session not found", 404)
         except PermissionError:
             return bad(handler, "Read-only imported sessions cannot be updated from WebUI", 403)
-        old_ws = getattr(s, "workspace", "")
-        try:
-            new_ws = str(resolve_trusted_workspace(body.get("workspace", s.workspace), profile=getattr(s, "profile", None)))
-        except ValueError as e:
-            return bad(handler, str(e))
+        # #7776 Finding 2: capture CLI source identity before the lock so the
+        # lock-held reload cannot drop it on save.
+        _update_cli_meta = _lookup_cli_session_metadata(body["session_id"]) or {}
         with _get_session_agent_lock(body["session_id"]):
+            try:
+                s = _resolve_session_under_lock(body["session_id"], s)
+            except KeyError:
+                s = None
+            if s is None:
+                return bad(handler, "Session not found", 404)
+            if getattr(s, "read_only", False):
+                return bad(handler, "Read-only imported sessions cannot be updated from WebUI", 403)
+            if _update_cli_meta:
+                _apply_cli_source_meta_to_session(s, _update_cli_meta)
+            old_ws = getattr(s, "workspace", "")
+            try:
+                new_ws = str(resolve_trusted_workspace(body.get("workspace", s.workspace), profile=getattr(s, "profile", None)))
+            except ValueError as e:
+                return bad(handler, str(e))
             s.workspace = new_ws
             if "model" in body or "model_provider" in body:
                 changed = _invalidate_session_route_state_if_changed(
@@ -17460,6 +17513,7 @@ def handle_post(handler, parsed) -> bool:
 
                     _evict_session_agent(body["session_id"])
             s.save()
+            _publish_saved_session(body["session_id"], s)
         if str(old_ws or "") != str(new_ws or ""):
             try:
                 from api.terminal import close_terminal
@@ -17640,6 +17694,12 @@ def handle_post(handler, parsed) -> bool:
             return bad(handler, "Session not found", 404)
         sid = body["session_id"]
         with _get_session_agent_lock(sid):
+            try:
+                s = _resolve_session_under_lock(sid, s)
+            except KeyError:
+                s = None
+            if s is None:
+                return bad(handler, "Session not found", 404)
             had_sidecar_messages = bool(s.messages or [])
             # Clear is a full truncate-to-empty: route through the SAME helper the
             # /api/session/truncate handler uses (single source of truth) so the
@@ -17712,6 +17772,7 @@ def handle_post(handler, parsed) -> bool:
                     s.path.with_suffix('.json.bak').unlink(missing_ok=True)
                 except OSError:
                     logger.warning("session clear could not remove stale backup for %s", sid, exc_info=True)
+            _publish_saved_session(sid, s)
         # Evict cached agent outside the per-session lock.  Eviction may run a
         # boundary memory commit for batch-extraction providers, and provider
         # I/O must not hold the session mutation lock.
@@ -17746,10 +17807,17 @@ def handle_post(handler, parsed) -> bool:
         if keep < 0:
             return bad(handler, "keep_count must be non-negative")
         with _get_session_agent_lock(body["session_id"]):
+            try:
+                s = _resolve_session_under_lock(body["session_id"], s)
+            except KeyError:
+                s = None
+            if s is None:
+                return bad(handler, "Session not found", 404)
             from api.session_ops import truncate_session_at_keep
 
             old_msg_count, old_ctx_count = truncate_session_at_keep(s, keep)
             s.save()
+            _publish_saved_session(body["session_id"], s)
             logger.info(
                 "truncate %s: messages %d→%d, context_messages %d→%d, watermark=%.2f",
                 body["session_id"], old_msg_count, len(s.messages or []),
@@ -18658,12 +18726,16 @@ def handle_post(handler, parsed) -> bool:
                     s.pinned = True
             if admission_error:
                 return bad(handler, *admission_error)
-            with _get_session_agent_lock(body["session_id"]):
-                s.save()
-        else:
-            with _get_session_agent_lock(body["session_id"]):
-                s.pinned = pin_requested
-                s.save()
+        with _get_session_agent_lock(body["session_id"]):
+            try:
+                s = _resolve_session_under_lock(body["session_id"], s)
+            except KeyError:
+                s = None
+            if s is None:
+                return bad(handler, "Session not found", 404)
+            s.pinned = pin_requested
+            s.save()
+            _publish_saved_session(body["session_id"], s)
         publish_session_list_changed(
             "session_pin",
             profile=getattr(s, "profile", None),
