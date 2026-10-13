@@ -1872,3 +1872,120 @@ def test_empty_session_deleted_before_lock_is_not_resurrected(tmp_path, monkeypa
     assert captured["status"] == 404, f"expected 404, got {captured}"
     assert sid not in SESSIONS
     assert not (session_dir / f"{sid}.json").exists()
+
+
+# ---------------------------------------------------------------------------
+# Session.save() chokepoint — a stale snapshot never rolls an effort pick back
+# ---------------------------------------------------------------------------
+
+
+def _pick_xhigh_via_route(monkeypatch, sid, captured=None, writer_body=None):
+    """Persist an XHigh pick through the real /api/reasoning handler. With
+    ``captured``, reuse that recorder and restore ``writer_body`` afterwards
+    so an enclosing request can still read its own body and response.
+    """
+    _stub_reasoning_profile_side_effects(monkeypatch)
+    monkeypatch.setattr(routes, "_lookup_cli_session_metadata", lambda value: {})
+    pick_body = {"effort": "xhigh", "session_id": sid}
+    if captured is None:
+        captured = _capture_post(monkeypatch, pick_body)
+    else:
+        monkeypatch.setattr(routes, "read_body", lambda handler: pick_body)
+    routes.handle_post(_FakeHandler(b"{}"), SimpleNamespace(path="/api/reasoning"))
+    assert captured["status"] == 200, f"effort pick failed: {captured}"
+    if writer_body is not None:
+        monkeypatch.setattr(routes, "read_body", lambda handler: writer_body)
+
+
+def _seed_low_session(tmp_path, sid):
+    s = Session(
+        session_id=sid,
+        title="t",
+        workspace=str(tmp_path),
+        messages=[{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hello"}],
+        reasoning_effort="low",
+    )
+    s.save()
+    return s
+
+
+@pytest.mark.parametrize("shape", ["evicted-cache-object", "detached-load"])
+def test_stale_snapshot_save_keeps_effort_pick(tmp_path, monkeypatch, shape):
+    """#7881 gate round: chat start, compression, CLI refresh, branching and
+    share all save an object resolved before a pick. Whatever the writer,
+    the save must keep the picked effort and still write its own change.
+    """
+    _isolate_session_store(tmp_path, monkeypatch)
+    sid = "stale-snapshot-effort"
+    seeded = _seed_low_session(tmp_path, sid)
+    if shape == "evicted-cache-object":
+        SESSIONS[sid] = seeded
+        stale = seeded
+        SESSIONS.pop(sid)  # count-cap eviction before the pick
+    else:
+        SESSIONS[sid] = seeded  # the pick runs on the resident object
+        stale = Session.load(sid)  # CLI-refresh / compression-style snapshot
+
+    _pick_xhigh_via_route(monkeypatch, sid)
+
+    stale.title = "writer change"
+    stale.save()
+
+    assert stale.reasoning_effort == "xhigh", "the saved object must match disk"
+    SESSIONS.clear()
+    cold = Session.load(sid)
+    assert cold.reasoning_effort == "xhigh", (
+        f"a stale snapshot save undid the accepted pick; got {cold.reasoning_effort!r}"
+    )
+    assert cold.title == "writer change"
+
+
+def test_own_effort_change_and_rollback_are_still_written(tmp_path, monkeypatch):
+    _isolate_session_store(tmp_path, monkeypatch)
+    sid = "own-effort-change"
+    s = _seed_low_session(tmp_path, sid)
+    s.reasoning_effort = "high"
+    s.save()
+    assert Session.load(sid).reasoning_effort == "high"
+    s.reasoning_effort = "low"  # the route's rollback shape
+    s.save()
+    assert Session.load(sid).reasoning_effort == "low"
+
+
+@pytest.mark.parametrize("path", ["/api/share/create", "/api/share/revoke"])
+def test_share_writer_does_not_undo_effort_pick(tmp_path, monkeypatch, path):
+    """Share create/revoke save the session resolved before the share call,
+    without the session lock. A pick saved in that window must survive.
+    """
+    _isolate_session_store(tmp_path, monkeypatch)
+    sid = "share-stale-effort"
+    seeded = _seed_low_session(tmp_path, sid)
+    seeded.share_token = "tok"
+    seeded.save()
+    SESSIONS[sid] = seeded
+    monkeypatch.setattr(routes, "_session_requires_cli_metadata_lookup", lambda s: False)
+    monkeypatch.setattr(routes, "_publish_session_list_changed", lambda *a, **kw: None)
+
+    writer_body = {"session_id": sid}
+
+    def _pick_in_window(*_a, **_kw):
+        SESSIONS.pop(sid, None)
+        _pick_xhigh_via_route(monkeypatch, sid, captured, writer_body)
+        captured.clear()
+        return {
+            "share_token": "tok", "share_created_at": 1.0, "share_title": "t",
+            "share_message_count": 2, "share_updated_at": 1.0,
+        }
+
+    monkeypatch.setattr(routes, "create_or_refresh_share", _pick_in_window)
+    monkeypatch.setattr(routes, "revoke_share", _pick_in_window)
+    captured = _capture_post(monkeypatch, writer_body)
+    routes.handle_post(_FakeHandler(b"{}"), SimpleNamespace(path=path))
+
+    assert captured.get("status") == 200, f"expected 200, got {captured}"
+    SESSIONS.clear()
+    cold = Session.load(sid)
+    assert cold.reasoning_effort == "xhigh", (
+        f"{path} undid the accepted effort pick; got {cold.reasoning_effort!r}"
+    )
+    assert cold.share_token == (None if path.endswith("revoke") else "tok")

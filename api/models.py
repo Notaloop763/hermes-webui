@@ -1545,6 +1545,9 @@ class Session:
             if reasoning_effort is not None
             else None
         )
+        # The effort this object last loaded or saved; save() uses it to tell
+        # an own change from a stale snapshot (#7881).
+        self._reasoning_effort_saved = self.reasoning_effort
         # #5979: signature of the model the user DELIBERATELY picked this session
         # (``"<model>\x1f<provider>"``), or None. Used by the streaming resolver
         # to preserve a custom-proxy vendor namespace on a COLD catalog ONLY when
@@ -1689,6 +1692,15 @@ class Session:
             )
         if touch_updated_at:
             self.updated_at = time.time()
+        # #7881: only /api/reasoning picks an effort, and it saves under the
+        # session lock. Any other writer may hold a snapshot resolved before
+        # that pick. If this object has not changed the effort since it last
+        # loaded or saved it, keep the value on disk instead of rolling the
+        # pick back. This closes the stale-snapshot class for every writer.
+        if self.reasoning_effort == getattr(self, '_reasoning_effort_saved', self.reasoning_effort):
+            on_disk = _prefix_reasoning_effort(self.path)
+            if on_disk is not _NO_PREFIX_VALUE:
+                self.reasoning_effort = on_disk
         self._webui_pending_user_timestamp_identity = (
             _validated_webui_pending_user_timestamp_identity(
                 self, getattr(self, '_webui_pending_user_timestamp_identity', None)
@@ -1956,6 +1968,7 @@ class Session:
             except Exception:
                 pass
             raise
+        self._reasoning_effort_saved = self.reasoning_effort
 
         # #4985 belt-and-suspenders self-heal: a successful save with at
         # least one real message on the sidecar is unconditional proof the
@@ -5644,6 +5657,26 @@ def _prefix_message_count(path):
     if parsed.get('_mc_v') != _MESSAGE_COUNT_MARKER:
         return None
     return _parse_nonnegative_int(parsed.get('message_count'))
+
+
+_NO_PREFIX_VALUE = object()
+
+
+def _prefix_reasoning_effort(path):
+    """The sidecar's persisted ``reasoning_effort``, from the bounded prefix.
+
+    Returns ``_NO_PREFIX_VALUE`` when there is no file, the prefix is unreadable,
+    or the key is absent (legacy sidecar); the caller then writes its own value.
+    """
+    try:
+        raw = _read_metadata_json_prefix(path)
+        parsed = json.loads(raw) if raw else None
+    except (OSError, ValueError):
+        return _NO_PREFIX_VALUE
+    if not isinstance(parsed, dict) or 'reasoning_effort' not in parsed:
+        return _NO_PREFIX_VALUE
+    value = parsed['reasoning_effort']
+    return str(value).strip().lower() if value is not None else None
 
 
 def _legacy_sidecar_facts_get(sid):
