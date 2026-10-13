@@ -1598,3 +1598,45 @@ def test_draft_autosave_does_not_undo_effort_pick_saved_after_eviction(
     )
     assert cold.composer_draft == {"text": "new draft"}
     assert len(cold.messages) == 3, f"got {len(cold.messages)} messages"
+
+
+def test_draft_save_publishes_over_copy_cached_by_get_in_window(tmp_path, monkeypatch):
+    """A GET that caches the old copy after the draft's lock-held reload must
+    not keep the old draft in SESSIONS, or a later effort pick saves it back.
+    """
+    session_dir = _isolate_session_store(tmp_path, monkeypatch)
+    sid = "draft-get-window"
+    _stub_reasoning_profile_side_effects(monkeypatch)
+    _seed_stale_session(session_dir, sid, title="t", draft={"text": "old draft"})
+    SESSIONS.pop(sid, None)
+
+    bodies = {"body": {"session_id": sid, "text": "new draft"}}
+    captured = _capture_post(monkeypatch, None)
+    monkeypatch.setattr(routes, "read_body", lambda handler: bodies["body"])
+    real_ensure_full = routes._ensure_full_session_before_mutation
+
+    def _ensure_then_get(value, session):
+        full = real_ensure_full(value, session)
+        routes.get_session(value)  # concurrent GET caches the old draft
+        return full
+
+    monkeypatch.setattr(routes, "_ensure_full_session_before_mutation", _ensure_then_get)
+    real_lock_factory = routes._get_session_agent_lock
+    _install_swap_lock(monkeypatch, sid, swap_with=None)  # evicted before the lock
+    handler = _FakeHandler(b"{}")
+    handler.command = "POST"
+    routes.handle_post(handler, SimpleNamespace(path="/api/session/draft"))
+    assert captured["status"] == 200, f"expected 200, got {captured}"
+    assert SESSIONS[sid].composer_draft == {"text": "new draft"}
+
+    monkeypatch.setattr(routes, "_ensure_full_session_before_mutation", real_ensure_full)
+    monkeypatch.setattr(routes, "_get_session_agent_lock", real_lock_factory)
+    bodies["body"] = {"effort": "high", "session_id": sid}
+    routes.handle_post(_FakeHandler(b"{}"), SimpleNamespace(path="/api/reasoning"))
+    assert captured["status"] == 200, f"effort pick failed: {captured}"
+    SESSIONS.clear()
+    cold = Session.load(sid)
+    assert cold.reasoning_effort == "high"
+    assert cold.composer_draft == {"text": "new draft"}, (
+        f"a later effort pick saved the cached old draft back; got {cold.composer_draft!r}"
+    )

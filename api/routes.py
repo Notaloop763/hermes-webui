@@ -17403,6 +17403,12 @@ def handle_post(handler, parsed) -> bool:
                 s.save(touch_updated_at=False, skip_index=True)
                 _draft_mark("after_save")
                 saved_draft = s.composer_draft
+                # A GET in the window may have cached an older copy; publish
+                # the saved object so later writers don't trust that copy.
+                with LOCK:
+                    SESSIONS[sid] = s
+                    SESSIONS.move_to_end(sid)
+                    _evict_sessions_over_cap()  # #4765: safe LRU eviction (never active/unsaved)
         _draft_mark("released_lock")
         payload = {"ok": True, "draft": saved_draft}
         if unchanged:
