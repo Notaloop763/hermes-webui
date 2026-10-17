@@ -169,7 +169,9 @@ class TestSessionPersistence(unittest.TestCase):
     def test_session_recursion_failure_warns_with_state_dir_and_starts_fresh(self) -> None:
         """Deeply nested JSON must warn and fall back to an empty session table."""
         sessions_file = _TEST_STATE / '.sessions.json'
-        depth = 50000
+        # Deep enough to raise RecursionError on 3.11-3.14; 3.14's C decoder
+        # parses nesting well past 50k.
+        depth = 1_000_000
         sessions_file.write_text('{"token":' * depth + '0' + '}' * depth)
         with self.assertLogs('api.auth', level='WARNING') as captured:
             self._simulate_restart()
