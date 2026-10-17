@@ -276,6 +276,15 @@ def test_docker_init_excludes_egg_info_during_staging():
         "with code 23."
     )
 
+    assert "--exclude='/uv-cache'" in stage_block, (
+        "rsync staging must skip the agent image's baked uv cache seed "
+        "(/opt/hermes/uv-cache, hermes-agent v0.22.2+); the editable install "
+        "never reads it."
+    )
+    assert '"$_stage_src"/uv-cache' in stage_block, (
+        "cp-fallback must remove the staged uv-cache, mirroring the rsync exclude."
+    )
+
 
 def test_docker_init_excludes_unreadable_install_lock_during_staging():
     """An unreadable `tools/.install.lock` in the agent source must not be staged.
