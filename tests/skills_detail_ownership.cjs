@@ -183,20 +183,22 @@ const compose = () => {
     },{action,timeout});
     reports.push({scenario:'transport-'+action,timeout,...report});await page.close();
   }
-  // Real panel lifecycle: visible switch awaits the destination load; hidden
-  // switch reloads only on reopening through switchPanel -> loadSkills.
+  // Real panel lifecycle on both switch paths: a visible switch awaits the
+  // destination load; a hidden switch reloads only on reopening through
+  // switchPanel -> loadSkills.
+  for(const switcher of ['switchToProfile','_switchProfileForSessionLoad'])
   for(const visibility of ['visible','hidden'])for(const oldFirst of [false,true]){
     const page=await browser.newPage();
     await page.route('http://127.0.0.1:8789/fixture',r=>r.fulfill({contentType:'text/html',body:html}));
     await page.goto('http://127.0.0.1:8789/fixture');await page.evaluate(setup);
     for(const file of ['sessions.js','panels.js'])await page.addScriptTag({content:fs.readFileSync(root+'/static/'+file,'utf8')});
     await page.evaluate(compose);
-    const report=await page.evaluate(async({visibility,oldFirst})=>{
+    const report=await page.evaluate(async({switcher,visibility,oldFirst})=>{
       await populate('A');
       if(visibility==='visible')await switchPanel('skills');
       _skillsDataIncomplete=true;loadSkills();const old=requests.at(-1);
       let switched=false;
-      const transition=switchToProfile('B').then(()=>{switched=true;});
+      const transition=window[switcher]('B').then(()=>{switched=true;});
       await flush();
       const switchOrdinal=requestLog.findLast(r=>r.path==='/api/profile/switch').ordinal;
       const immediate=snapshot();
@@ -211,8 +213,8 @@ const compose = () => {
       if(!oldFirst){old.resolve(payload('A'));await flush();}
       return {immediate,before,after:snapshot(),destinationRequests:requestLog.filter(r=>r.profile==='B'&&r.path==='/api/skills').length,
         requestLog,mutationsAfterSwitch:mutationsAfter(switchOrdinal)};
-    },{visibility,oldFirst});
-    reports.push({scenario:'panel-'+visibility,oldFirst,...report});await page.close();
+    },{switcher,visibility,oldFirst});
+    reports.push({scenario:'panel-'+visibility,switcher,oldFirst,...report});await page.close();
   }
   for(const action of ['toggle','save','delete','delete-cancel','file-retry','delete-during-file']){
     const page=await browser.newPage();

@@ -141,7 +141,7 @@ fetch fixture to check that stale network failures do not retry and stale timeou
 do not toast. This proves browser publication/transport ownership rather than real
 Agent behavior.
 
-This one pytest item runs all 132 schedules with a 180-second subprocess limit
+This one pytest item runs all 138 schedules with a 180-second subprocess limit
 and a focused 240-second pytest timeout override. The margin lets controller
 timeouts and report assertions finish under CI's default `--timeout=60` without
 changing the limit for other tests. Verify with

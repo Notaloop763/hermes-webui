@@ -2580,6 +2580,10 @@ async function _switchProfileForSessionLoad(profile){
     if(typeof renderSessionListFromCache==='function') renderSessionListFromCache();
     throw switchErr;
   }
+  // The accepted switch emptied a visible Skills panel; load the new profile's
+  // list as the canonical switch does (_profileSwitchPanelLoad in panels.js).
+  // Outside the try: a load failure is not a failed switch.
+  if(typeof loadSkills==='function'&&typeof _currentPanel!=='undefined'&&_currentPanel==='skills') await loadSkills();
 }
 
 async function loadSession(sid){

@@ -8,7 +8,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 
 
-# All 134 browser schedules run in one item. Allow the bounded 180-second
+# All 138 browser schedules run in one item. Allow the bounded 180-second
 # controller to finish (or report its own timeout) under CI's --timeout=60.
 @pytest.mark.timeout(240)
 def test_production_skills_detail_and_mutation_ownership():
@@ -23,7 +23,7 @@ def test_production_skills_detail_and_mutation_ownership():
                           capture_output=True, text=True, timeout=180)
     assert proc.returncode == 0, proc.stderr
     reports = json.loads(proc.stdout)
-    assert len(reports) == 134
+    assert len(reports) == 138
     for report in reports:
         if 'happy' in report:
             assert report['editing'] is report['pre'] is None, report
