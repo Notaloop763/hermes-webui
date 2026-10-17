@@ -485,7 +485,9 @@ else
     # to avoid the timestamp-update path setuptools takes when one is present.
     # It also skips the agent's runtime-store lock (HERMES_RUNTIME_DIR is
     # /opt/hermes/tools since v0.21.6): root-owned and unreadable to
-    # hermeswebui, it fails rsync with code 23.
+    # hermeswebui, it fails rsync with code 23. Since v0.22.2 the image also
+    # bakes a uv cache seed at /opt/hermes/uv-cache; the editable install never
+    # reads it, so it is skipped rather than copied on every fresh boot.
     #
     # NB: `rsync -a` / `cp -a` preserve the source tree's mode bits, so a `:ro`
     # source mounted mode 555 leaves the staged copy also mode 555. setuptools
@@ -500,7 +502,7 @@ else
       rsync -a \
         --exclude='*.egg-info' --exclude='build' --exclude='dist' \
         --exclude='__pycache__' --exclude='.git' \
-        --exclude='.playwright' --exclude='/tools/.install.lock' \
+        --exclude='.playwright' --exclude='/tools/.install.lock' --exclude='/uv-cache' \
         "$_agent_src"/ "$_stage_src"/ \
         || error_exit "Failed to stage hermes-agent source to writable build dir"
     else
@@ -509,7 +511,7 @@ else
       cp -a "$_agent_src"/. "$_stage_src"/ \
         || error_exit "Failed to copy hermes-agent source to writable build dir"
       rm -rf "$_stage_src"/*.egg-info "$_stage_src"/build "$_stage_src"/dist 2>/dev/null || true
-      rm -rf "$_stage_src"/.playwright 2>/dev/null || true
+      rm -rf "$_stage_src"/.playwright "$_stage_src"/uv-cache 2>/dev/null || true
       find "$_stage_src" -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
     fi
     chmod -R u+w "$_stage_src" \
