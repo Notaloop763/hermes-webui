@@ -1,12 +1,14 @@
 """Profile-scoped external skill discovery through the WebUI Skills API.
 
 A named WebUI profile resolves its skills root from the per-request active
-profile, but ``skills.external_dirs`` is read by the Agent helper through the
-Hermes home. These tests pin the request-profile scope around that lookup so a
-profile with ``external_dirs`` configured shows its shared skills, the
-root/default profile resolves its own home (not a streaming turn's mirror), and
-the response reports ``runtime_scope``. The fail-closed and legacy paths are
-covered agent-free in ``test_profile_external_skills_scope.py``.
+profile, and ``skills.external_dirs`` from that profile's own config and
+environment rather than the Agent helper's process-wide Hermes home. These tests
+drive the real Agent scanner through the HTTP handlers so a profile with
+``external_dirs`` configured shows its shared skills, the root/default profile
+resolves its own home (not a streaming turn's mirror), one rejected entry skips
+only itself, and the response reports ``runtime_scope``. Agent routing shapes and
+unreadable configs are covered agent-free in
+``test_profile_external_skills_scope.py``.
 """
 
 from pathlib import Path
@@ -59,21 +61,6 @@ def _patch_active_profile(monkeypatch, profiles, name: str, home: Path, process_
     monkeypatch.setattr(profiles, "get_process_profile_home", lambda: process_home)
 
 
-def _patch_agent_routing(monkeypatch, *, routed: bool) -> None:
-    """Pin the Agent's routed-profile predicate so the test does not depend on process state.
-
-    A real Agent without ``serves_routed_profile`` degrades to the legacy process-wide
-    lookup, which still resolves external roots from the bound home; the scope label
-    assertion below accepts either outcome.
-    """
-    try:
-        import agent.secret_scope as secret_scope
-    except Exception:
-        return
-    if hasattr(secret_scope, "serves_routed_profile"):
-        monkeypatch.setattr(secret_scope, "serves_routed_profile", lambda: routed)
-
-
 def test_skills_api_reads_external_dirs_from_request_profile(monkeypatch, tmp_path):
     """A named profile's shared skills must not resolve from default HERMES_HOME."""
     from api import profiles, routes
@@ -88,14 +75,13 @@ def test_skills_api_reads_external_dirs_from_request_profile(monkeypatch, tmp_pa
 
     monkeypatch.setenv("HERMES_HOME", str(default_home))
     _patch_active_profile(monkeypatch, profiles, "translation", active_home, default_home)
-    _patch_agent_routing(monkeypatch, routed=True)
 
     captured = _capture_json(monkeypatch, routes)
     handled = routes.handle_get(MagicMock(), urlparse("/api/skills"))
 
     assert handled is True
     assert captured["status"] == 200
-    assert captured["payload"]["runtime_scope"] in {"profile", "legacy_process"}
+    assert captured["payload"]["runtime_scope"] == "profile"
     skills = {item["name"]: item for item in captured["payload"]["skills"]}
     assert set(skills) == {"translation-local", "shared-library"}
     # A flat skill under an external root is labeled with that root's name.
@@ -122,10 +108,9 @@ def test_home_variable_keeps_listing_and_content_in_request_profile(monkeypatch,
     ):
         monkeypatch.setenv('HERMES_HOME', str(mirror))
         _patch_active_profile(monkeypatch, profiles, profile, home, root)
-        _patch_agent_routing(monkeypatch, routed=home != root)
         routes.handle_get(MagicMock(), urlparse('/api/skills'))
         assert {s['name'] for s in captured['payload']['skills']} == {own}
-        assert captured['payload']['runtime_scope'] in {'profile', 'legacy_process'}
+        assert captured['payload']['runtime_scope'] == 'profile'
         routes.handle_get(MagicMock(), urlparse(f'/api/skills/content?name={own}'))
         assert captured['payload']['success'] is True
         routes.handle_get(MagicMock(), urlparse(
@@ -153,7 +138,6 @@ def test_skills_content_resolves_external_skill_from_request_profile(monkeypatch
 
     monkeypatch.setenv("HERMES_HOME", str(default_home))
     _patch_active_profile(monkeypatch, profiles, "translation", active_home, default_home)
-    _patch_agent_routing(monkeypatch, routed=True)
 
     captured = _capture_json(monkeypatch, routes)
     handled = routes.handle_get(
@@ -177,14 +161,13 @@ def test_skills_api_default_profile_reads_external_dirs_from_process_home(monkey
 
     monkeypatch.setenv("HERMES_HOME", str(default_home))
     _patch_active_profile(monkeypatch, profiles, "default", default_home, default_home)
-    _patch_agent_routing(monkeypatch, routed=False)
 
     captured = _capture_json(monkeypatch, routes)
     handled = routes.handle_get(MagicMock(), urlparse("/api/skills"))
 
     assert handled is True
     assert captured["status"] == 200
-    assert captured["payload"]["runtime_scope"] in {"profile", "legacy_process"}
+    assert captured["payload"]["runtime_scope"] == "profile"
     assert {item["name"] for item in captured["payload"]["skills"]} == {
         "default-local",
         "shared-library",
@@ -205,7 +188,6 @@ def test_skills_api_lists_external_dirs_without_local_skills_dir(monkeypatch, tm
 
     monkeypatch.setenv("HERMES_HOME", str(default_home))
     _patch_active_profile(monkeypatch, profiles, "translation", active_home, default_home)
-    _patch_agent_routing(monkeypatch, routed=True)
 
     captured = _capture_json(monkeypatch, routes)
     handled = routes.handle_get(MagicMock(), urlparse("/api/skills"))
@@ -214,3 +196,29 @@ def test_skills_api_lists_external_dirs_without_local_skills_dir(monkeypatch, tm
     assert captured["status"] == 200
     assert {item["name"] for item in captured["payload"]["skills"]} == {"shared-library"}
     assert (active_home / "skills").is_dir()
+
+
+def test_one_unresolved_entry_keeps_listing_and_linked_files(monkeypatch, tmp_path):
+    """Gate repro: ``[<valid dir>, "$MISSING"]`` must still list and serve the valid root."""
+    from api import helpers, profiles, routes
+
+    default_home = tmp_path / "default"
+    active_home = tmp_path / "profiles" / "translation"
+    shared_skills = tmp_path / "shared-skills"
+    _write_skill(shared_skills, "team-skill")
+    (shared_skills / "team-skill" / "notes.txt").write_text("team notes", encoding="utf-8")
+    _write_config(default_home, [])
+    _write_config(active_home, [str(shared_skills), "$REL7842_MISSING"])
+
+    monkeypatch.delenv("REL7842_MISSING", raising=False)
+    monkeypatch.setenv("HERMES_HOME", str(default_home))
+    _patch_active_profile(monkeypatch, profiles, "translation", active_home, default_home)
+
+    captured = _capture_json(monkeypatch, routes)
+    monkeypatch.setattr(helpers, "j", routes.j)
+    routes.handle_get(MagicMock(), urlparse("/api/skills"))
+    assert captured["payload"]["runtime_scope"] == "profile"
+    assert {item["name"] for item in captured["payload"]["skills"]} == {"team-skill"}
+    routes.handle_get(MagicMock(), urlparse("/api/skills/content?name=team-skill&file=notes.txt"))
+    assert captured["status"] == 200
+    assert captured["payload"]["content"] == "team notes"

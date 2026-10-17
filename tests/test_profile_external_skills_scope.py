@@ -1,11 +1,11 @@
 """Agent-free contract tests for profile-scoped external skill roots.
 
 ``tests/test_profile_external_skills_api.py`` drives the real Hermes Agent; CI has
-no agent checkout, so this file models the small agent surface the WebUI relies on
-(context-local home override, routed-profile predicate, home key) and pins the WebUI
-side of the contract: which profile is bound, that external roots come from it, the
-fail-closed path, and the legacy fallback. The shape mirrors
-``tests/test_mcp_runtime_profile_scope_unit.py``.
+no agent checkout, so this file models the agent surface around the lookup
+(context-local home override, routed-profile predicate, process-env expansion) and
+pins the WebUI side of the contract: external roots come from the request
+profile's own files whatever that surface reports, one rejected entry skips only
+itself, and an unreadable skills config withholds external roots.
 """
 
 import os
@@ -146,7 +146,7 @@ def test_external_roots_resolve_from_request_profile(monkeypatch, tmp_path):
 
     assert shared_skills in dirs
     assert scope == "profile"
-    # The read-only scope is released on exit, not leaked to the next request.
+    # The lookup never installs an Agent home override.
     assert agent.override is None
 
 
@@ -178,8 +178,13 @@ def test_root_profile_binds_its_own_home_not_a_mirrored_turn(monkeypatch, tmp_pa
     assert scope == "profile"
 
 
-def test_routing_disagreement_withholds_external_roots(monkeypatch, tmp_path):
-    """Fail closed: an unconfirmed scope must not contribute external roots."""
+@pytest.mark.parametrize('agent_shape', [
+    {'routed': False},  # routed-profile check disagrees (mirrored streaming turn)
+    {'expose_routing': False},  # Agent without the routed-profile predicate
+    {'expose_routing': False, 'expose_home_override': False},  # no home override
+], ids=['routing-disagrees', 'no-routed-predicate', 'no-home-override'])
+def test_agent_routing_state_does_not_withhold_external_roots(monkeypatch, tmp_path, agent_shape):
+    """The resolver reads the request profile's files, so Agent routing is not consulted."""
     from api import profiles, routes
 
     default_home = tmp_path / "default"
@@ -194,13 +199,13 @@ def test_routing_disagreement_withholds_external_roots(monkeypatch, tmp_path):
         monkeypatch,
         external_dirs_by_home={active_home: [shared_skills]},
         process_home=default_home,
-        routed=False,
+        **agent_shape,
     )
 
     dirs, scope = routes._active_skill_search_dirs_scoped(active_home / "skills")
 
-    assert shared_skills not in dirs
-    assert scope == "unavailable"
+    assert dirs == [active_home / "skills", shared_skills]
+    assert scope == "profile"
     assert agent.override is None
 
 
@@ -251,80 +256,190 @@ def test_profile_path_expansion_uses_own_env_and_observes_edits(monkeypatch, tmp
     (home / 'config.yaml').write_text('skills:\n  external_dirs: ["$SKILL_ROOT"]\n')
     (home / '.env').write_text('')
     assert routes._active_skill_search_dirs_scoped(home / 'skills') == (
-        [home / 'skills'], 'unavailable',
+        [home / 'skills'], 'profile',
     )
 
 
-@pytest.mark.parametrize('replacement', ['$MISSING_ROOT', '${MISSING_ROOT}', '${SKILL_ROOT}'])
-def test_replacement_values_cannot_introduce_unresolved_path_tokens(monkeypatch, tmp_path, replacement):
+@pytest.mark.parametrize('replacement', [
+    '$MISSING_ROOT', '${MISSING_ROOT}', '${SKILL_ROOT}', 'skills$v2',
+])
+def test_expansion_is_single_pass_and_keeps_unknown_tokens_literal(monkeypatch, tmp_path, replacement):
+    """Match os.path.expandvars: a `$` in a replacement value stays literal text."""
     from api import profiles, routes
 
     root = tmp_path / 'root'
     home = tmp_path / 'named'
     (home / 'skills').mkdir(parents=True)
-    # A literal-token directory exists: accepting unresolved replacement tokens
-    # would make it visible instead of rejecting the unconfirmed external root.
     (home / replacement).mkdir()
     _patch_profile(monkeypatch, profiles, 'named', home, root)
     _install_fake_agent(monkeypatch, external_dirs_by_home={home: ['$SKILL_ROOT']},
                         process_home=root)
     (home / '.env').write_text(f'SKILL_ROOT={replacement}\n')
     assert routes._active_skill_search_dirs_scoped(home / 'skills') == (
-        [home / 'skills'], 'unavailable',
+        [home / 'skills', home / replacement], 'profile',
     )
 
 
-def test_agent_without_routed_predicate_reports_legacy_scope(monkeypatch, tmp_path):
-    """An agent that predates routed-profile routing keeps its process-wide lookup."""
+@pytest.mark.parametrize('rejected', [
+    '$MISSING_ROOT', '${MISSING_ROOT}', '$CHAINED_ROOT', '~nosuchuser7842/skills',
+    'loop', '/nul\x00byte', 'skills', '${HERMES_HOME}/skills',
+], ids=['bare-var', 'braced-var', 'replacement-token', 'unknown-user-home', 'symlink-loop',
+        'nul-byte', 'local-skills-dir', 'local-skills-var'])
+def test_one_rejected_entry_keeps_the_other_external_roots(monkeypatch, tmp_path, rejected):
+    """Skip an entry that resolves to no directory, as the Agent does, and keep the rest."""
     from api import profiles, routes
 
-    default_home = tmp_path / "default"
-    active_home = tmp_path / "profiles" / "translation"
-    shared_skills = tmp_path / "shared-skills"
-    (active_home / "skills").mkdir(parents=True)
-    shared_skills.mkdir()
+    root = tmp_path / 'root'
+    home = tmp_path / 'named'
+    first, second = tmp_path / 'first', tmp_path / 'second'
+    for directory in (home / 'skills', first, second):
+        directory.mkdir(parents=True)
+    _patch_profile(monkeypatch, profiles, 'named', home, root)
+    _install_fake_agent(monkeypatch, external_dirs_by_home={
+        home: [str(first), rejected, str(second), str(first)],
+    }, process_home=root)
+    (home / '.env').write_text('CHAINED_ROOT=$MISSING_ROOT\n')
+    # A relative entry resolves under the profile home; make it a symlink loop.
+    (home / 'loop').symlink_to(home / 'loop')
 
-    monkeypatch.setenv("HERMES_HOME", str(default_home))
-    _patch_profile(monkeypatch, profiles, "translation", active_home, default_home)
-    _install_fake_agent(
-        monkeypatch,
-        external_dirs_by_home={active_home: [shared_skills]},
-        process_home=default_home,
-        expose_routing=False,
+    assert routes._active_skill_search_dirs_scoped(home / 'skills') == (
+        [home / 'skills', first, second], 'profile',
     )
 
-    dirs, scope = routes._active_skill_search_dirs_scoped(active_home / "skills")
 
-    assert shared_skills in dirs
-    assert scope == "legacy_process"
-
-
-def test_legacy_agent_without_home_override_withholds_external_roots(monkeypatch, tmp_path):
-    """Fail closed when a legacy Agent cannot bind the request profile's home.
-
-    Without the context-local home override the Agent helper reads the process-wide
-    ``HERMES_HOME`` (which a streaming turn may have mirrored to another profile), so
-    trusting it could expose another profile's external roots.
-    """
+@pytest.mark.parametrize('profile', ['translation', 'default'])
+def test_profiles_can_share_skills_through_external_dirs(monkeypatch, tmp_path, profile):
+    """Agent-supported sharing: a profile may list another profile's skills tree."""
     from api import profiles, routes
 
-    default_home = tmp_path / "default"
-    active_home = tmp_path / "profiles" / "translation"
-    shared_skills = tmp_path / "shared-skills"
-    (active_home / "skills").mkdir(parents=True)
-    shared_skills.mkdir()
+    root = tmp_path / 'hermes'
+    translation = root / 'profiles' / 'translation'
+    other = root / 'profiles' / 'other'
+    for directory in (root / 'skills', translation / 'skills', other / 'skills'):
+        directory.mkdir(parents=True)
+    home = translation if profile == 'translation' else root
+    monkeypatch.setattr(profiles, '_DEFAULT_HERMES_HOME', root)
+    _patch_profile(monkeypatch, profiles, profile, home, root)
+    shared = [root / 'skills', other / 'skills'] if profile == 'translation' else [
+        translation / 'skills', other / 'skills',
+    ]
+    _install_fake_agent(monkeypatch, external_dirs_by_home={home: shared}, process_home=root)
 
-    monkeypatch.setenv("HERMES_HOME", str(default_home))
-    _patch_profile(monkeypatch, profiles, "translation", active_home, default_home)
-    _install_fake_agent(
-        monkeypatch,
-        external_dirs_by_home={active_home: [shared_skills]},
-        process_home=default_home,
-        expose_routing=False,
-        expose_home_override=False,
+    assert routes._active_skill_search_dirs_scoped(home / 'skills') == (
+        [home / 'skills', *shared], 'profile',
     )
 
-    dirs, scope = routes._active_skill_search_dirs_scoped(active_home / "skills")
 
-    assert shared_skills not in dirs
-    assert scope == "unavailable"
+@pytest.mark.skipif(not Path('/root').is_dir(), reason='needs an account home to name')
+def test_other_user_home_expands_as_the_agent_does(monkeypatch, tmp_path):
+    from api import profiles, routes
+
+    root = tmp_path / 'root'
+    home = tmp_path / 'named'
+    (home / 'skills').mkdir(parents=True)
+    _patch_profile(monkeypatch, profiles, 'named', home, root)
+    _install_fake_agent(monkeypatch, external_dirs_by_home={home: ['~root']},
+                        process_home=root)
+
+    assert routes._active_skill_search_dirs_scoped(home / 'skills') == (
+        [home / 'skills', Path(os.path.expanduser('~root')).resolve()], 'profile',
+    )
+
+
+def test_unreadable_external_dir_keeps_the_other_external_roots(monkeypatch, tmp_path):
+    """An entry the server cannot stat is skipped like a missing one."""
+    from api import profiles, routes
+
+    root = tmp_path / 'root'
+    home = tmp_path / 'named'
+    shared = tmp_path / 'shared'
+    locked = tmp_path / 'locked'
+    for directory in (home / 'skills', shared, locked / 'inner'):
+        directory.mkdir(parents=True)
+    _patch_profile(monkeypatch, profiles, 'named', home, root)
+    _install_fake_agent(monkeypatch, external_dirs_by_home={
+        home: [str(locked / 'inner'), str(shared)],
+    }, process_home=root)
+    original_is_dir = Path.is_dir
+
+    def is_dir(path):
+        if path == locked / 'inner':
+            raise PermissionError(13, 'Permission denied', str(path))
+        return original_is_dir(path)
+
+    monkeypatch.setattr(Path, 'is_dir', is_dir)
+
+    assert routes._active_skill_search_dirs_scoped(home / 'skills') == (
+        [home / 'skills', shared], 'profile',
+    )
+
+
+@pytest.mark.parametrize('config_text', [
+    'skills:\n', 'skills:\n  external_dirs:\n', '{}\n', '',
+], ids=['skills-null', 'dirs-null', 'empty-mapping', 'empty-file'])
+def test_empty_skills_config_lists_no_external_roots(monkeypatch, tmp_path, config_text):
+    """An empty or bare ``skills:`` section is a complete, empty external set."""
+    from api import profiles, routes
+
+    root = tmp_path / 'root'
+    home = tmp_path / 'named'
+    (home / 'skills').mkdir(parents=True)
+    _patch_profile(monkeypatch, profiles, 'named', home, root)
+    _install_fake_agent(monkeypatch, external_dirs_by_home={}, process_home=root)
+    (home / 'config.yaml').write_text(config_text)
+
+    assert routes._active_skill_search_dirs_scoped(home / 'skills') == (
+        [home / 'skills'], 'profile',
+    )
+
+
+@pytest.mark.parametrize('config_text, listed', [
+    ('skills: [unclosed\n', []),
+    ('- not\n- a mapping\n', []),
+    ('skills: shared\n', []),
+    ('skills:\n  external_dirs: {path: /x}\n', []),
+    ('\ufeffskills:\n  external_dirs: [shared]\n', ['shared']),
+    ('skills:\n  external_dirs: [2024, shared]\n', ['2024', 'shared']),
+    ('# caf\xe9\nskills:\n  external_dirs: [shared]\n', []),
+], ids=['invalid-yaml', 'top-level-list', 'skills-not-mapping', 'dirs-not-list',
+        'utf8-bom', 'non-string-entry', 'not-utf8'])
+def test_malformed_skills_config_is_read_as_the_agent_reads_it(monkeypatch, tmp_path,
+                                                               config_text, listed):
+    """Follow the Agent's config reader: malformed lists none, entries are str()'d."""
+    from api import profiles, routes
+
+    root = tmp_path / 'root'
+    home = tmp_path / 'named'
+    for directory in (home / 'skills', home / 'shared', home / '2024'):
+        directory.mkdir(parents=True)
+    _patch_profile(monkeypatch, profiles, 'named', home, root)
+    _install_fake_agent(monkeypatch, external_dirs_by_home={}, process_home=root)
+    # Latin-1 keeps a non-UTF-8 byte in the not-utf8 row; ASCII rows are identical.
+    encoding = 'latin-1' if '\xe9' in config_text else 'utf-8'
+    (home / 'config.yaml').write_text(config_text, encoding=encoding)
+
+    assert routes._active_skill_search_dirs_scoped(home / 'skills') == (
+        [home / 'skills', *(home / name for name in listed)], 'profile',
+    )
+
+
+@pytest.mark.skipif(hasattr(os, 'geteuid') and os.geteuid() == 0,
+                    reason='root reads files regardless of mode')
+def test_unreadable_config_reports_unavailable(monkeypatch, tmp_path):
+    """A config that cannot be read is retried later, not cached as an empty list."""
+    from api import profiles, routes
+
+    root = tmp_path / 'root'
+    home = tmp_path / 'named'
+    (home / 'skills').mkdir(parents=True)
+    (home / 'shared').mkdir()
+    _patch_profile(monkeypatch, profiles, 'named', home, root)
+    _install_fake_agent(monkeypatch, external_dirs_by_home={home: ['shared']},
+                        process_home=root)
+    (home / 'config.yaml').chmod(0)
+    try:
+        assert routes._active_skill_search_dirs_scoped(home / 'skills') == (
+            [home / 'skills'], 'unavailable',
+        )
+    finally:
+        (home / 'config.yaml').chmod(0o600)

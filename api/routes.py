@@ -1165,23 +1165,20 @@ def _active_skill_search_dirs_scoped(skills_dir: Path) -> tuple[list[Path], str]
 
     ``skills_dir`` is already resolved from the request's active profile, but the
     Agent helper expands ``skills.external_dirs`` through the process environment.
-    Bind the request-profile scope around our own resolver (root included) so it reads
-    its own ``config.yaml``, and use external roots only when the Agent's routing
-    agrees with the profile WebUI resolved. Returns the existing directories and the
-    scope label (``profile`` / ``legacy_process`` / ``unavailable``) for the caller to
-    report; external roots are withheld (fail closed) when the scope is unconfirmed.
+    Resolve external roots from the request profile's own ``config.yaml`` and
+    environment instead (root included). Returns the existing directories and the
+    scope label (``profile`` / ``unavailable``) for the caller to report; external
+    roots are withheld only when the profile's config cannot be read.
     """
+    from api.profiles import get_active_hermes_home
     from api.skill_runtime import (
-        SCOPE_UNAVAILABLE, profile_external_skill_dirs, skill_runtime_scope,
+        SCOPE_PROFILE, SCOPE_UNAVAILABLE, profile_external_skill_dirs,
     )
 
     dirs = [skills_dir]
-    scope = SCOPE_UNAVAILABLE
     try:
-        with skill_runtime_scope() as view:
-            scope = view.scope_label
-            if view.trusted:
-                dirs.extend(profile_external_skill_dirs(view.profile_home))
+        dirs.extend(profile_external_skill_dirs(Path(get_active_hermes_home())))
+        scope = SCOPE_PROFILE
     except Exception:
         logger.debug("External skill-directory lookup failed", exc_info=True)
         scope = SCOPE_UNAVAILABLE

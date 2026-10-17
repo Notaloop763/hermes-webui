@@ -110,16 +110,10 @@ def test_skills_import_and_route_work_with_ruamel_only(tmp_path):
         from api import profiles, routes, yaml_compat
         assert yaml_compat.BACKEND == 'ruamel'
         home = Path(sys.argv[1])
-        # Stub only the Agent routing and scanner API; YAML parsing and the
-        # profile environment/resolver/HTTP route remain production code.
-        constants = types.ModuleType('hermes_constants')
-        constants.set_hermes_home_override = lambda value: None
-        constants.reset_hermes_home_override = lambda token: None
-        constants.hermes_home_key = lambda path: str(path)
+        # Stub only the Agent scanner API; YAML parsing and the profile
+        # environment/resolver/HTTP route remain production code.
         agent = types.ModuleType('agent')
         agent.__path__ = []
-        scope = types.ModuleType('agent.secret_scope')
-        scope.serves_routed_profile = lambda: False
         scanner = types.ModuleType('agent.skill_utils')
         scanner.iter_skill_index_files = lambda root, pattern: root.rglob(pattern)
         tools = types.ModuleType('tools')
@@ -130,8 +124,7 @@ def test_skills_import_and_route_work_with_ruamel_only(tmp_path):
         skills._parse_frontmatter = lambda text: (yaml_compat.safe_load(text.split('---')[1]), '')
         skills._sort_skills = lambda values: values
         skills.skill_matches_platform = lambda frontmatter: True
-        sys.modules.update({'hermes_constants':constants, 'agent':agent,
-            'agent.secret_scope':scope, 'agent.skill_utils':scanner,
+        sys.modules.update({'agent':agent, 'agent.skill_utils':scanner,
             'tools':tools, 'tools.skills_tool':skills})
         profiles.get_active_profile_name = lambda: 'default'
         profiles.get_hermes_home_for_profile = lambda name: home

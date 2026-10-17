@@ -81,15 +81,16 @@ def test_skills_launch_environment_is_root_only_and_stable(tmp_path, case):
         elif case.startswith('root'):
             expected.append('team-skill')
         assert sorted(s['name'] for s in payload['skills']) == sorted(expected), payload
-        assert payload['runtime_scope'] == ('unavailable' if case in ('named', 'pinned-named') else 'profile'), payload
+        # A named profile without its own value skips that entry; the list is complete.
+        assert payload['runtime_scope'] == 'profile', payload
         assert agent.override is None
         assert os.environ['REL7842_SKILL_ROOT'] == str(mirrored)
-        # A variable introduced only after startup remains unconfirmed, even
-        # for root. Neither later stream values nor a late resolver import own it.
+        # A variable introduced only after startup never resolves, even for
+        # root. Neither later stream values nor a late resolver import own it.
         os.environ['REL7842_LATE_ROOT'] = str(mirrored)
         (home / 'config.yaml').write_text('skills:\\n  external_dirs: ["$REL7842_LATE_ROOT"]\\n')
         routes.handle_get(MagicMock(), urlparse('/api/skills'))
-        assert payloads[-1]['runtime_scope'] == 'unavailable', payloads[-1]
+        assert payloads[-1]['runtime_scope'] == 'profile', payloads[-1]
         assert [s['name'] for s in payloads[-1]['skills']] == ['local-skill'], payloads[-1]
     ''')
     proc = subprocess.run(

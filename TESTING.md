@@ -109,10 +109,13 @@ npx eslint --no-config-lookup -c eslint.runtime-guard.config.mjs "static/**/*.js
 
 Run `./scripts/test.sh tests/test_skills_launch_environment.py tests/test_profile_external_skills_scope.py`
 for external-root path expansion. Fresh subprocesses exercise the production
-`/api/skills` handler with an Agent routing/scanner adapter and disposable homes.
+`/api/skills` handler with an Agent scanner adapter and disposable homes.
 They cover root launch variables, renamed-root identity, profile `.env` precedence,
-named and isolated named profiles, and rejection of variables introduced after
-startup. Live environment changes before the resolver imports must not redirect
+named and isolated named profiles, and skipping of variables introduced after
+startup. The scope tests also check that Agent routing shapes do not withhold
+roots, that one rejected entry keeps the other roots, that expansion and
+malformed config follow the Agent's reader, and that only an unreadable
+`config.yaml` reports `unavailable`. Live environment changes before the resolver imports must not redirect
 the lookup. This is WebUI boundary proof, not real-Agent integration.
 
 Run `./scripts/test.sh tests/test_skills_runtime_scope_cache.py tests/test_skills_detail_ownership.py`.
