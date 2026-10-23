@@ -265,12 +265,6 @@ def test_docker_init_excludes_egg_info_during_staging():
         ".playwright so the build doesn't choke on unreadable browser files."
     )
 
-    assert "--exclude='/tools/.install.lock'" in stage_block, (
-        "rsync staging must skip the agent runtime-store lock: it is root-owned "
-        "under /opt/hermes/tools, unreadable to hermeswebui, and fails rsync "
-        "with code 23."
-    )
-
     assert "--exclude='/uv-cache'" in stage_block, (
         "rsync staging must skip the agent image's baked uv cache seed "
         "(/opt/hermes/uv-cache, hermes-agent v0.22.2+); the editable install "

@@ -769,7 +769,7 @@ rebuild_agent_venv() {
   if [ "$_rv_py" != "-" ]; then
     UV_PYTHON="$_rv_py" uv venv "$_agent_venv" && _rv_ok=1
   else
-    uv venv --python "${HERMES_WEBUI_PYTHON:-/usr/local/bin/python3}" "$_agent_venv" && _rv_ok=1
+    uv venv "$_agent_venv" && _rv_ok=1
   fi
   if [ "$_rv_ok" = 1 ] && [ -n "$_rv_pyproject" ] && [ -f "$_venv_helper" ] \
       && ! python3 "$_venv_helper" --admits "$_rv_pyproject" "$_agent_venv"; then
