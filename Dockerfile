@@ -1,4 +1,9 @@
-FROM python:3.12-slim
+# Python 3.14 from the same python-build-standalone release the Hermes Agent
+# image pins in pm/lock.json (hermes-agent v0.22.5: CPython 3.14.9+20261021), so
+# a Mnemosyne side venv created here uses the same interpreter build as the
+# agent container. The WebUI project supports Python 3.11-3.14 (pyproject
+# requires-python >=3.11; scripts/test.sh probes python3.14 first).
+FROM debian:13.4
 
 LABEL maintainer="nesquena"
 LABEL description="Hermes Web UI — browser interface for Hermes Agent"
@@ -26,12 +31,49 @@ RUN apt-get update -y --fix-missing --no-install-recommends \
     openssh-client \
     git \
     xz-utils \
+    python3 \
+    python3-dev \
+    python3-venv \
     && apt-get upgrade -y \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
+# ── Python 3.14 (python-build-standalone) ───────────────────────────────────
+# Same artifacts and sha256 digests as hermes-agent pm/lock.json at v0.22.5.
+# Installed at the Agent's managed-store path (pm store_entry is
+# "<name>-<version>-<target>" under HERMES_RUNTIME_DIR=/opt/hermes/tools) so a
+# shared Mnemosyne venv records a base interpreter both containers can execute.
+# uv records the symlink's directory as a venv's home (/usr/local/bin for
+# /usr/local/bin/python3), which the agent image also provides; /opt/python is
+# only a convenience link. When the agent pin moves, bump these ARGs together
+# from its pm/lock.json.
+ARG PYTHON_VERSION=3.14.9
+ARG PYTHON_PBS_RELEASE=20261021
+ARG PYTHON_SHA256_X64=dfa4c5a40c47f338f41658017be550c72247c391e6bfb1fa4da03ebc8451abdf
+ARG PYTHON_SHA256_ARM64=847895ba727440b012207bb0192282d7e182eb991ae5c7bb5c35c6a12a99e732
+ARG PYTHON_STORE=/opt/hermes/tools
+ARG TARGETARCH
+COPY --chmod=444 docker/python/sitecustomize.py /usr/local/share/hermes/sitecustomize.py
+RUN case "${TARGETARCH:-$(dpkg --print-architecture)}" in \
+        amd64) triple=x86_64-unknown-linux-gnu; pmt=linux-x64; sha="${PYTHON_SHA256_X64}" ;; \
+        arm64) triple=aarch64-unknown-linux-gnu; pmt=linux-arm64; sha="${PYTHON_SHA256_ARM64}" ;; \
+        *) echo "unsupported architecture: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac \
+    && home="${PYTHON_STORE}/python-${PYTHON_VERSION}+${PYTHON_PBS_RELEASE}-${pmt}" \
+    && curl -fsSL "https://github.com/astral-sh/python-build-standalone/releases/download/${PYTHON_PBS_RELEASE}/cpython-${PYTHON_VERSION}+${PYTHON_PBS_RELEASE}-${triple}-install_only.tar.gz" -o /tmp/python.tar.gz \
+    && echo "${sha}  /tmp/python.tar.gz" | sha256sum -c - \
+    && mkdir -p "${home}" \
+    && tar -xzf /tmp/python.tar.gz -C "${home}" --strip-components=1 \
+    && rm -f /tmp/python.tar.gz \
+    && ln -s "${home}" /opt/python \
+    && install -m 0444 /usr/local/share/hermes/sitecustomize.py "${home}/lib/python3.14/sitecustomize.py" \
+    && ln -s "${home}/bin/python3" /usr/local/bin/python3 \
+    && ln -s "${home}/bin/python3" /usr/local/bin/python3.14 \
+    && ln -s "${home}/bin/python3" /usr/local/bin/python \
+    && python3 -c "import sys; assert sys.version_info[:2] == (3, 14), sys.version"
+
 # ── SQLite upgrade ──────────────────────────────────────────────────────────
-# The python:3.12-slim base ships SQLite 3.46.1 (Debian Trixie), which is
+# The Debian 13 base ships SQLite 3.46.1 (Trixie), which is
 # vulnerable to the WAL-reset corruption bug discovered March 2026.
 # https://sqlite.org/wal.html#walresetbug
 #
@@ -72,7 +114,18 @@ assert c.execute('PRAGMA secure_delete').fetchone()[0] == 1, \
     'SQLITE_SECURE_DELETE not compiled in (deleted rows would remain recoverable)'; \
 c.execute('CREATE VIRTUAL TABLE _fts5_build_check USING fts5(x)'); \
 c.execute('DROP TABLE _fts5_build_check'); \
-c.close()"
+c.close()" \
+    && python3 -I -c "\
+import ctypes, sys, _sqlite3, sqlite3; \
+lib = ctypes.CDLL('/usr/local/lib/libsqlite3.so.0'); \
+lib.sqlite3_compileoption_used.argtypes = [ctypes.c_char_p]; \
+assert lib.sqlite3_compileoption_used(b'SECURE_DELETE') == 1, \
+    'built libsqlite3 lacks SECURE_DELETE'; \
+assert '_sqlite3' in sys.builtin_module_names, \
+    'PBS layout changed (_sqlite3 no longer builtin): re-evaluate docker/python/sitecustomize.py'; \
+assert _sqlite3.connect(':memory:').execute('PRAGMA secure_delete').fetchone()[0] == 0, \
+    'PBS now compiles SECURE_DELETE: sitecustomize shim is redundant'; \
+assert sqlite3.connect._hermes_secure_delete, 'sitecustomize shim not active'"
 
 # Optional GPU user-space acceleration libraries for users who pass through
 # host GPU devices. The default image remains CPU-only.
@@ -129,6 +182,14 @@ USER root
 # Installing as root places uv in /usr/local/bin, available to all users.
 # The init script will skip the download when uv is already on PATH.
 RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh
+
+# Prove the SQLite secure_delete property and interpreter path inside a real uv
+# venv, the shape the app and a shared Mnemosyne venv use.
+RUN d="$(mktemp -d)" \
+    && uv venv -q --python /usr/local/bin/python3 "$d/v" \
+    && readlink -f "$d/v/bin/python" | grep -qE "^/opt/hermes/tools/python-[^/]*/bin/python3\.14$" \
+    && "$d/v/bin/python" -I -c "import sqlite3; assert sqlite3.connect(':memory:').execute('PRAGMA secure_delete').fetchone()[0] == 1" \
+    && rm -rf "$d"
 
 COPY --chown=root:root . /apptoo
 

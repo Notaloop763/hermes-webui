@@ -35,7 +35,7 @@ def test_local_test_runner_uses_supported_venv_before_pytest_collection():
     conftest = (ROOT / "tests" / "conftest.py").read_text(encoding="utf-8")
     resolve_body = runner.split("resolve_venv_python() {", 1)[1].split("\n}\n\nVENV_PY", 1)[0]
 
-    assert "python3.13 python3.12 python3.11 python3" in runner
+    assert "python3.14 python3.13 python3.12 python3.11 python3" in runner
     assert "requirements-dev.txt" in runner
     assert 'HERMES_WEBUI_TEST_PYTHON' in runner
     assert "resolve_venv_python()" in runner
@@ -46,7 +46,7 @@ def test_local_test_runner_uses_supported_venv_before_pytest_collection():
     # Destructive-fs guard: never create/clear a virtualenv through a symlinked .venv
     # (`python -m venv --clear` would empty the symlink's target).
     assert '-L "$VENV_DIR"' in runner
-    assert "Hermes WebUI tests require Python 3.11, 3.12, or 3.13" in conftest
+    assert "Hermes WebUI tests require Python 3.11, 3.12, 3.13, or 3.14" in conftest
     assert "Run ./scripts/test.sh" in conftest
 
 

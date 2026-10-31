@@ -1238,7 +1238,9 @@ def test_branch_markers_report_fail_closed_unknown_state():
 
     # A valid but pathologically deep payload overflows the decoder with
     # RecursionError (not ValueError); it must degrade to 'unknown', not crash.
-    depth = 12_000
+    # Deep enough to raise RecursionError on 3.11-3.14; 3.14's C decoder
+    # parses nesting well past 12k.
+    depth = 1_000_000
     deep_payload = '[' * depth + ']' * depth
     with pytest.raises(RecursionError):
         json.loads(deep_payload)
