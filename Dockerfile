@@ -1,5 +1,5 @@
 # Python 3.14 from the same python-build-standalone release the Hermes Agent
-# image pins in pm/lock.json (hermes-agent v0.22.5: CPython 3.14.9+20261021), so
+# image pins in pm/lock.json (hermes-agent v0.23.3: CPython 3.14.9+20261021), so
 # a Mnemosyne side venv created here uses the same interpreter build as the
 # agent container. The WebUI project supports Python 3.11-3.14 (pyproject
 # requires-python >=3.11; scripts/test.sh probes python3.14 first).
@@ -39,7 +39,7 @@ RUN apt-get update -y --fix-missing --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # ── Python 3.14 (python-build-standalone) ───────────────────────────────────
-# Same artifacts and sha256 digests as hermes-agent pm/lock.json at v0.22.5.
+# Same artifacts and sha256 digests as hermes-agent pm/lock.json at v0.23.3.
 # Installed at the Agent's managed-store path (pm store_entry is
 # "<name>-<version>-<target>" under HERMES_RUNTIME_DIR=/opt/hermes/tools) so a
 # shared Mnemosyne venv records a base interpreter both containers can execute.
